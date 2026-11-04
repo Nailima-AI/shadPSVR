@@ -26,10 +26,12 @@ void Presenter::SubmitXrEyes(const std::array<AmdGpu::Image, 2>& eyes,
     if (!xr.EyeSwapchainsMatch(submission.width, submission.height)) {
         draw_scheduler.Finish();
         xr_views = {};
+        xr_images = {};
     }
     if (xr.EnsureEyeSwapchains(submission.width, submission.height)) {
         for (u32 eye = 0; eye < 2; ++eye) {
-            for (VkImage image : xr.GetEyeSwapchainImages(eye)) {
+            xr_images[eye] = xr.GetEyeSwapchainImages(eye);
+            for (VkImage image : xr_images[eye]) {
                 auto [result, view] = instance.GetDevice().createImageViewUnique({
                     .image = image,
                     .viewType = vk::ImageViewType::e2D,
@@ -44,6 +46,7 @@ void Presenter::SubmitXrEyes(const std::array<AmdGpu::Image, 2>& eyes,
                     LOG_ERROR(Render_Vulkan, "Failed to create XR image view: {}",
                               vk::to_string(result));
                     xr_views = {};
+                    xr_images = {};
                     return;
                 }
                 xr_views[eye].push_back(std::move(view));
@@ -85,7 +88,7 @@ void Presenter::SubmitXrEyes(const std::array<AmdGpu::Image, 2>& eyes,
         Frame target{
             .width = submission.width[eye],
             .height = submission.height[eye],
-            .image = xr.GetEyeSwapchainImages(eye)[indices[eye]],
+            .image = xr_images[eye][indices[eye]],
             .image_view = *xr_views[eye][indices[eye]],
         };
         const vk::ImageMemoryBarrier2 to_attachment{

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <vector>
 
 #include "camera_helpers.h"
 #include "core/emulator_settings.h"
@@ -25,21 +26,43 @@ bool IsCameraConnected() {
 
 void ScaleYUY2(const u8* src, u32 src_pitch, u32 src_width, u32 src_height, u8* dst, u32 dst_width,
                u32 dst_height) {
-    const u32 src_pairs = src_width / 2;
     const u32 dst_pairs = dst_width / 2;
-    if (src_pairs == 0 || src_height == 0) {
+    if (src_width < 2 || src_height == 0) {
         FillBlackYUY2(dst, dst_width, dst_height);
         return;
     }
+    const bool same_width = (src_width & ~1u) == (dst_width & ~1u);
+
+    // Per output pair: the source macropixel holding the first pixel's chroma, and the byte
+    // offsets of both output pixels' luma.
+    struct Column {
+        u32 chroma;
+        u32 luma0;
+        u32 luma1;
+    };
+    thread_local std::vector<Column> columns;
+    if (!same_width) {
+        columns.resize(dst_pairs);
+        for (u32 pair = 0; pair < dst_pairs; ++pair) {
+            const u32 x0 = static_cast<u32>(u64{pair * 2} * src_width / dst_width);
+            const u32 x1 = static_cast<u32>(u64{pair * 2 + 1} * src_width / dst_width);
+            columns[pair] = {(x0 & ~1u) * 2, x0 * 2, x1 * 2};
+        }
+    }
     for (u32 y = 0; y < dst_height; ++y) {
-        const u8* src_row = src + static_cast<u64>(y * src_height / dst_height) * src_pitch;
-        u8* dst_row = dst + static_cast<u64>(y) * dst_width * 2;
-        if (src_pairs == dst_pairs) {
-            std::memcpy(dst_row, src_row, dst_width * 2);
+        const u8* src_row = src + u64{y} * src_height / dst_height * src_pitch;
+        u8* dst_row = dst + u64{y} * dst_width * 2;
+        if (same_width) {
+            std::memcpy(dst_row, src_row, dst_pairs * 4);
             continue;
         }
         for (u32 pair = 0; pair < dst_pairs; ++pair) {
-            std::memcpy(dst_row + pair * 4, src_row + (pair * src_pairs / dst_pairs) * 4, 4);
+            const Column& column = columns[pair];
+            u32 macropixel;
+            std::memcpy(&macropixel, src_row + column.chroma, sizeof(macropixel));
+            macropixel = (macropixel & 0xFF00FF00u) | src_row[column.luma0] |
+                         (u32{src_row[column.luma1]} << 16);
+            std::memcpy(dst_row + pair * 4, &macropixel, sizeof(macropixel));
         }
     }
 }

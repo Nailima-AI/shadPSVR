@@ -43,6 +43,7 @@ static constexpr size_t c_yuy2_frame_size = static_cast<size_t>(c_width) * c_hei
 static std::array<std::vector<u8>, ORBIS_CAMERA_MAX_DEVICE_NUM> yuy2_frames{
     std::vector<u8>(c_yuy2_frame_size), std::vector<u8>(c_yuy2_frame_size)};
 static bool g_host_is_ps_camera = false;
+static bool g_frame_content_changed = false;
 
 // A PlayStation Camera with its firmware loaded shows up as one packed YUY2 frame per pair:
 // a 96 byte row header, then the left and right 1280 pixel images, then padding.
@@ -144,6 +145,7 @@ static bool AcquireHostFrame() {
         }
     }
     SDL_ReleaseCameraFrame(sdl_camera, frame);
+    g_frame_content_changed |= converted != nullptr;
     return converted != nullptr;
 }
 
@@ -229,21 +231,31 @@ s32 PS4_SYSV_ABI sceCameraGetFrameData(s32 handle, OrbisCameraFrameData* frame_d
         .formats = {output_config0.format, output_config1.format},
         .levels = {g_format_levels[0], g_format_levels[1]},
     };
-    const bool convert = new_frame || !g_converted_layout || *g_converted_layout != layout;
+    const bool convert =
+        g_frame_content_changed || !g_converted_layout || *g_converted_layout != layout;
     g_converted_layout = layout;
+    g_frame_content_changed = false;
+    const bool mono = !g_host_is_ps_camera || backend == CameraBackend::Virtual;
     u16* raw16_buffers[ORBIS_CAMERA_MAX_DEVICE_NUM] = {raw16_buffer1, raw16_buffer2};
     u8* raw8_buffers[ORBIS_CAMERA_MAX_DEVICE_NUM] = {raw8_buffer1, raw8_buffer2};
     for (s32 device = 0; device < ORBIS_CAMERA_MAX_DEVICE_NUM; ++device) {
         const auto& format = configs[device]->format;
         void* base =
             BaseLevelBuffer(format.formatLevel0, raw16_buffers[device], raw8_buffers[device]);
+        const bool copy_device0 = mono && device == 1 &&
+                                  std::memcmp(&format, &configs[0]->format, sizeof(format)) == 0 &&
+                                  g_format_levels[1] == g_format_levels[0];
+        const u32 base_size = c_width * c_height * SizeOfBaseFormat(format.formatLevel0);
         if (convert && base) {
-            WriteBaseLevel(yuy2_frames[device], format.formatLevel0, base);
+            if (copy_device0) {
+                std::memcpy(base, frame_data->pFramePointerList[0][0], base_size);
+            } else {
+                WriteBaseLevel(yuy2_frames[device], format.formatLevel0, base);
+            }
         }
         frame_data->pFramePointerList[device][0] = base;
         frame_data->framePosition[device][0] = {0, 0, c_width, c_height};
-        frame_data->frameSize[device][0] =
-            c_width * c_height * SizeOfBaseFormat(format.formatLevel0);
+        frame_data->frameSize[device][0] = base_size;
         frame_data->meta.format[device][0] = format.formatLevel0;
 
         const OrbisCameraScaleFormat scaled_formats[c_scaled_levels] = {
@@ -257,7 +269,10 @@ s32 PS4_SYSV_ABI sceCameraGetFrameData(s32 handle, OrbisCameraFrameData* frame_d
                 frame_data->frameSize[device][level + 1] = 0;
                 continue;
             }
-            if (convert) {
+            if (convert && copy_device0) {
+                std::memcpy(scaled_buffers[1][level], scaled_buffers[0][level],
+                            width * height * SizeOfScaleFormat(scaled));
+            } else if (convert) {
                 WriteScaledLevel(yuy2_frames[device], scaled, width, height,
                                  scaled_buffers[device][level]);
             }
@@ -370,6 +385,7 @@ s32 PS4_SYSV_ABI sceCameraOpen(Libraries::UserService::OrbisUserServiceUserId us
     }
     g_frame_counter = 0;
     g_converted_layout.reset();
+    g_frame_content_changed = false;
 
     g_library_opened = true;
     return ++g_handles;

@@ -60,6 +60,9 @@ Rebind in SteamVR's controller settings for the "psvr" action set.
   GPU submits wait with it: profile there first if the frame rate drops.
 - Eye textures are copied once the GPU queues are idle, after the title's earlier command
   buffers. Titles that keep the GPU busy without a gap would delay the copy.
+- `sceVrTrackerGetResult` ignores `prediction_time` and returns the pose OpenXR predicted for the
+  next headset frame. Display stays correct because each frame is handed to SteamVR with the pose
+  it was rendered with, so its reprojection removes the difference.
 - `label` in the reprojection frame parameters is never written. If a title waits on it, it will
   stall.
 - Move sphere offset (9 cm from the grip) and the Move axis convention (+Y along the shaft) come

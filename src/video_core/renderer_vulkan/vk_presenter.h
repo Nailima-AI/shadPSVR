@@ -143,6 +143,7 @@ private:
     HostPasses::PostProcessingPass xr_pp_pass;
     bool xr_pp_created{false};
     std::array<std::vector<vk::UniqueImageView>, 2> xr_views;
+    std::array<std::vector<VkImage>, 2> xr_images;
 };
 
 } // namespace Vulkan
