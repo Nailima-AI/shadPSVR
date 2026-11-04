@@ -9,10 +9,13 @@
 #include "core/libraries/error_codes.h"
 #include "core/libraries/kernel/memory.h"
 #include "core/libraries/kernel/process.h"
+#include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
 #include "core/memory.h"
 
+#include <array>
 #include <utility>
+#include <vector>
 
 #include <thread>
 #include "SDL3/SDL_camera.h"
@@ -27,6 +30,28 @@ static constexpr s32 c_width = 1280, c_height = 800;
 
 static u16 *raw16_buffer1{}, *raw16_buffer2{};
 static u8 *raw8_buffer1{}, *raw8_buffer2{};
+
+static constexpr u32 c_scaled_levels = ORBIS_CAMERA_MAX_FORMAT_LEVEL_NUM - 1;
+static constexpr std::array<std::pair<u32, u32>, c_scaled_levels> c_scaled_sizes{{
+    {c_width / 2, c_height / 2},
+    {c_width / 4, c_height / 4},
+    {c_width / 8, c_height / 8},
+}};
+static u8* scaled_buffers[ORBIS_CAMERA_MAX_DEVICE_NUM][c_scaled_levels]{};
+static constexpr size_t c_yuy2_frame_size = static_cast<size_t>(c_width) * c_height * 2;
+static std::array<std::vector<u8>, ORBIS_CAMERA_MAX_DEVICE_NUM> yuy2_frames{
+    std::vector<u8>(c_yuy2_frame_size), std::vector<u8>(c_yuy2_frame_size)};
+static bool g_host_is_ps_camera = false;
+
+// A PlayStation Camera with its firmware loaded shows up as one packed YUY2 frame per pair:
+// a 96 byte row header, then the left and right 1280 pixel images, then padding.
+static constexpr u32 c_ps_camera_width = 3448;
+static constexpr u32 c_ps_camera_height = 808;
+static constexpr u32 c_ps_camera_row_header = 96;
+static std::vector<u8> yuy2_scaled(c_yuy2_frame_size / 4);
+static u32 g_format_levels[ORBIS_CAMERA_MAX_DEVICE_NUM]{1, 1};
+static u64 g_frame_counter = 0;
+static u64 g_frame_timestamp = 0;
 
 SDL_Camera* sdl_camera = nullptr;
 OrbisCameraConfigExtention output_config0, output_config1;
@@ -58,6 +83,7 @@ s32 PS4_SYSV_ABI sceCameraClose(s32 handle) {
 
     if (sdl_camera) {
         SDL_CloseCamera(sdl_camera);
+        sdl_camera = nullptr;
     }
 
     return ORBIS_OK;
@@ -80,6 +106,74 @@ s32 PS4_SYSV_ABI sceCameraCloseByHandle(s32 handle) {
     return ORBIS_OK;
 }
 
+static bool AcquireHostFrame() {
+    Uint64 timestamp_ns = 0;
+    SDL_Surface* frame = SDL_AcquireCameraFrame(sdl_camera, &timestamp_ns);
+    if (!frame) {
+        return false;
+    }
+    SDL_Surface* converted = frame->format == SDL_PIXELFORMAT_YUY2
+                                 ? frame
+                                 : SDL_ConvertSurface(frame, SDL_PIXELFORMAT_YUY2);
+    if (converted) {
+        const auto* pixels = static_cast<const u8*>(converted->pixels);
+        if (g_host_is_ps_camera && converted->w == static_cast<int>(c_ps_camera_width)) {
+            for (s32 device = 0; device < ORBIS_CAMERA_MAX_DEVICE_NUM; ++device) {
+                ScaleYUY2(pixels + c_ps_camera_row_header + device * c_width * 2, converted->pitch,
+                          c_width, c_height, yuy2_frames[device].data(), c_width, c_height);
+            }
+        } else {
+            ScaleYUY2(pixels, converted->pitch, converted->w, converted->h, yuy2_frames[0].data(),
+                      c_width, c_height);
+            yuy2_frames[1] = yuy2_frames[0];
+        }
+        if (converted != frame) {
+            SDL_DestroySurface(converted);
+        }
+    }
+    SDL_ReleaseCameraFrame(sdl_camera, frame);
+    return converted != nullptr;
+}
+
+static void WriteBaseLevel(const std::vector<u8>& yuy2_frame, OrbisCameraBaseFormat format,
+                           u16* raw16, u8* raw8, void*& out) {
+    switch (format) {
+    case ORBIS_CAMERA_FORMAT_YUV422:
+        std::memcpy(raw16, yuy2_frame.data(), c_width * c_height * sizeof(u16));
+        out = raw16;
+        break;
+    case ORBIS_CAMERA_FORMAT_RAW16:
+        ConvertYUY2ToRAW16(yuy2_frame.data(), raw16, c_width, c_height);
+        out = raw16;
+        break;
+    case ORBIS_CAMERA_FORMAT_RAW8:
+        ConvertYUY2ToRAW8(yuy2_frame.data(), raw8, c_width, c_height);
+        out = raw8;
+        break;
+    default:
+        out = nullptr;
+        break;
+    }
+}
+
+static void WriteScaledLevel(const std::vector<u8>& yuy2_frame, OrbisCameraScaleFormat format,
+                             u32 width, u32 height, u8* dst) {
+    ScaleYUY2(yuy2_frame.data(), c_width * 2, c_width, c_height, yuy2_scaled.data(), width, height);
+    switch (format) {
+    case ORBIS_CAMERA_SCALE_FORMAT_YUV422:
+        std::memcpy(dst, yuy2_scaled.data(), width * height * 2);
+        break;
+    case ORBIS_CAMERA_SCALE_FORMAT_Y16:
+        ConvertYUY2ToY16(yuy2_scaled.data(), reinterpret_cast<u16*>(dst), width, height);
+        break;
+    case ORBIS_CAMERA_SCALE_FORMAT_Y8:
+        ConvertYUY2ToY8(yuy2_scaled.data(), dst, width, height);
+        break;
+    default:
+        break;
+    }
+}
+
 s32 PS4_SYSV_ABI sceCameraGetFrameData(s32 handle, OrbisCameraFrameData* frame_data) {
     if (frame_data == nullptr) {
         return ORBIS_CAMERA_ERROR_PARAM;
@@ -90,96 +184,67 @@ s32 PS4_SYSV_ABI sceCameraGetFrameData(s32 handle, OrbisCameraFrameData* frame_d
     if (handle < 1 || frame_data->sizeThis > 584) {
         return ORBIS_CAMERA_ERROR_PARAM;
     }
-    if (!g_library_opened || !sdl_camera) {
+    const CameraBackend backend = GetCameraBackend();
+    if (!g_library_opened || (backend == CameraBackend::Host && !sdl_camera)) {
         return ORBIS_CAMERA_ERROR_NOT_OPEN;
     }
-    if (EmulatorSettings.GetCameraId() == -1) {
+    if (backend == CameraBackend::Disconnected) {
         return ORBIS_CAMERA_ERROR_NOT_CONNECTED;
     }
-    Uint64 timestampNS = 0;
-    static SDL_Surface* frame = nullptr;
-    if (frame) { // release previous frame, if it exists
-        SDL_ReleaseCameraFrame(sdl_camera, frame);
-    }
-    frame = SDL_AcquireCameraFrame(sdl_camera, &timestampNS);
 
-    frame_data->status[0] = frame != nullptr ? 1 : -1;
-    frame_data->status[1] = frame != nullptr ? 1 : -1;
-    if (!frame) {
-        switch (output_config0.format.formatLevel0) {
-        case ORBIS_CAMERA_FORMAT_YUV422:
-            frame_data->pFramePointerList[0][0] = raw16_buffer1;
-            break;
-        case ORBIS_CAMERA_FORMAT_RAW16:
-            frame_data->pFramePointerList[0][0] = raw16_buffer1;
-            break;
-        case ORBIS_CAMERA_FORMAT_RAW8:
-            frame_data->pFramePointerList[0][0] = raw8_buffer1;
-            break;
-        default:
-            UNREACHABLE();
-        }
-        switch (output_config1.format.formatLevel0) {
-        case ORBIS_CAMERA_FORMAT_YUV422:
-            frame_data->pFramePointerList[1][0] = raw16_buffer2;
-            break;
-        case ORBIS_CAMERA_FORMAT_RAW16:
-            frame_data->pFramePointerList[1][0] = raw16_buffer2;
-            break;
-        case ORBIS_CAMERA_FORMAT_RAW8:
-            frame_data->pFramePointerList[1][0] = raw8_buffer2;
-            break;
-        default:
-            UNREACHABLE();
-        }
-        return frame_data->pFramePointerList[0][0] == nullptr ? ORBIS_CAMERA_ERROR_BUSY : ORBIS_OK;
+    if (backend == CameraBackend::Virtual || AcquireHostFrame()) {
+        ++g_frame_counter;
+        g_frame_timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    } else if (g_frame_counter == 0) {
+        return ORBIS_CAMERA_ERROR_BUSY;
     }
 
-    switch (output_config0.format.formatLevel0) {
-    case ORBIS_CAMERA_FORMAT_YUV422:
-        std::memcpy(raw16_buffer1, frame->pixels, c_width * c_height * sizeof(u16));
-        frame_data->pFramePointerList[0][0] = raw16_buffer1;
-        break;
-    case ORBIS_CAMERA_FORMAT_RAW16:
-        ConvertYUY2ToRAW16((u8*)frame->pixels, raw16_buffer1, c_width, c_height);
-        frame_data->pFramePointerList[0][0] = raw16_buffer1;
-        break;
-    case ORBIS_CAMERA_FORMAT_RAW8:
-        ConvertYUY2ToRAW8((u8*)frame->pixels, raw8_buffer1, c_width, c_height);
-        frame_data->pFramePointerList[0][0] = raw8_buffer1;
-        break;
-    default:
-        UNREACHABLE();
+    const OrbisCameraConfigExtention* configs[ORBIS_CAMERA_MAX_DEVICE_NUM] = {&output_config0,
+                                                                              &output_config1};
+    u16* raw16_buffers[ORBIS_CAMERA_MAX_DEVICE_NUM] = {raw16_buffer1, raw16_buffer2};
+    u8* raw8_buffers[ORBIS_CAMERA_MAX_DEVICE_NUM] = {raw8_buffer1, raw8_buffer2};
+    for (s32 device = 0; device < ORBIS_CAMERA_MAX_DEVICE_NUM; ++device) {
+        const auto& format = configs[device]->format;
+        WriteBaseLevel(yuy2_frames[device], format.formatLevel0, raw16_buffers[device],
+                       raw8_buffers[device], frame_data->pFramePointerList[device][0]);
+        frame_data->framePosition[device][0] = {0, 0, c_width, c_height};
+        frame_data->frameSize[device][0] =
+            c_width * c_height * SizeOfBaseFormat(format.formatLevel0);
+        frame_data->meta.format[device][0] = format.formatLevel0;
+
+        const OrbisCameraScaleFormat scaled_formats[c_scaled_levels] = {
+            format.formatLevel1, format.formatLevel2, format.formatLevel3};
+        for (u32 level = 0; level < c_scaled_levels; ++level) {
+            const auto [width, height] = c_scaled_sizes[level];
+            const OrbisCameraScaleFormat scaled = scaled_formats[level];
+            const bool requested = (g_format_levels[device] & (2u << level)) != 0;
+            if (!requested || SizeOfScaleFormat(scaled) == 0) {
+                frame_data->pFramePointerList[device][level + 1] = nullptr;
+                frame_data->frameSize[device][level + 1] = 0;
+                continue;
+            }
+            WriteScaledLevel(yuy2_frames[device], scaled, width, height,
+                             scaled_buffers[device][level]);
+            frame_data->pFramePointerList[device][level + 1] = scaled_buffers[device][level];
+            frame_data->framePosition[device][level + 1] = {0, 0, width, height};
+            frame_data->frameSize[device][level + 1] = width * height * SizeOfScaleFormat(scaled);
+            frame_data->meta.format[device][level + 1] = scaled;
+        }
+        frame_data->meta.frame[device] = g_frame_counter;
+        frame_data->meta.timestamp[device] = g_frame_timestamp;
+        frame_data->meta.deviceTimestamp[device] = static_cast<u32>(g_frame_timestamp);
+        frame_data->status[device] = 1;
     }
-    switch (output_config1.format.formatLevel0) {
-    case ORBIS_CAMERA_FORMAT_YUV422:
-        std::memcpy(raw16_buffer2, frame->pixels, c_width * c_height * sizeof(u16));
-        frame_data->pFramePointerList[1][0] = raw16_buffer2;
-        break;
-    case ORBIS_CAMERA_FORMAT_RAW16:
-        ConvertYUY2ToRAW16((u8*)frame->pixels, raw16_buffer2, c_width, c_height);
-        frame_data->pFramePointerList[1][0] = raw16_buffer2;
-        break;
-    case ORBIS_CAMERA_FORMAT_RAW8:
-        ConvertYUY2ToRAW8((u8*)frame->pixels, raw8_buffer2, c_width, c_height);
-        frame_data->pFramePointerList[1][0] = raw8_buffer2;
-        break;
-    default:
-        UNREACHABLE();
-    }
-    frame_data->meta.format[0][0] = output_config0.format.formatLevel0;
-    frame_data->meta.format[1][0] = output_config1.format.formatLevel0;
-    frame_data->frameSize[0][0] =
-        c_width * c_height * SizeOfBaseFormat(output_config0.format.formatLevel0);
-    frame_data->frameSize[1][0] =
-        c_width * c_height * SizeOfBaseFormat(output_config1.format.formatLevel0);
 
     // on older firmwares, this wasn't present, and the original library also checks struct size
     // instead of the SDK version, and without this check, we'd smash the stack in those games
     if (frame_data->sizeThis == 584) {
-        // not fully correct, but good enough
-        frame_data->pFramePointerListGarlic[0][0] = frame_data->pFramePointerList[0][0];
-        frame_data->pFramePointerListGarlic[1][0] = frame_data->pFramePointerList[1][0];
+        for (s32 device = 0; device < ORBIS_CAMERA_MAX_DEVICE_NUM; ++device) {
+            for (s32 level = 0; level < ORBIS_CAMERA_MAX_FORMAT_LEVEL_NUM; ++level) {
+                frame_data->pFramePointerListGarlic[device][level] =
+                    frame_data->pFramePointerList[device][level];
+            }
+        }
     }
     return ORBIS_OK;
 }
@@ -196,7 +261,7 @@ s32 PS4_SYSV_ABI sceCameraIsAttached(s32 index) {
         return ORBIS_CAMERA_ERROR_PARAM;
     }
     // 0 = disconnected, 1 = connected
-    return EmulatorSettings.GetCameraId() == -1 ? 0 : 1;
+    return IsCameraConnected() ? 1 : 0;
 }
 
 s32 PS4_SYSV_ABI sceCameraIsConfigChangeDone() {
@@ -250,13 +315,24 @@ s32 PS4_SYSV_ABI sceCameraOpen(Libraries::UserService::OrbisUserServiceUserId us
         remaining_camera_buf += raw16_buffer_size;
         raw16_buffer2 = (u16*)remaining_camera_buf;
         remaining_camera_buf += raw16_buffer_size;
+        for (auto& device_buffers : scaled_buffers) {
+            for (u32 level = 0; level < c_scaled_levels; ++level) {
+                device_buffers[level] = remaining_camera_buf;
+                remaining_camera_buf +=
+                    c_scaled_sizes[level].first * c_scaled_sizes[level].second * sizeof(u16);
+            }
+        }
 
         ASSERT(remaining_camera_buf <= (u8*)camera_garlic_pool + camera_system_mem_size);
 
         ASSERT(Core::Memory::Instance()->IsValidGpuMapping((VAddr)camera_garlic_pool,
                                                            camera_system_mem_size));
+        for (auto& frame : yuy2_frames) {
+            FillBlackYUY2(frame.data(), c_width, c_height);
+        }
         buffers_initialized = true;
     }
+    g_frame_counter = 0;
 
     g_library_opened = true;
     return ++g_handles;
@@ -294,8 +370,12 @@ s32 PS4_SYSV_ABI sceCameraStart(s32 handle, OrbisCameraStartParameter* param) {
         return ORBIS_CAMERA_ERROR_FORMAT_UNKNOWN;
     }
 
-    if (param->formatLevel[0] > 1 || param->formatLevel[1] > 1) {
-        LOG_ERROR(Lib_Camera, "Downscaled image retrieval isn't supported yet!");
+    g_format_levels[0] = param->formatLevel[0];
+    g_format_levels[1] = param->formatLevel[1];
+
+    if (GetCameraBackend() == CameraBackend::Virtual) {
+        LOG_INFO(Lib_Camera, "No host camera selected, using a virtual PlayStation Camera");
+        return ORBIS_OK;
     }
 
     SDL_CameraID* devices = NULL;
@@ -304,8 +384,10 @@ s32 PS4_SYSV_ABI sceCameraStart(s32 handle, OrbisCameraStartParameter* param) {
     if (devices == NULL) {
         LOG_ERROR(Lib_Camera, "Couldn't enumerate camera devices: {}", SDL_GetError());
         return ORBIS_CAMERA_ERROR_FATAL;
-    } else if (devcount == 0) {
-        LOG_INFO(Lib_Camera, "No camera devices connected");
+    } else if (devcount <= EmulatorSettings.GetCameraId()) {
+        LOG_INFO(Lib_Camera, "Camera {} is not connected ({} found)",
+                 EmulatorSettings.GetCameraId(), devcount);
+        SDL_free(devices);
         return ORBIS_CAMERA_ERROR_NOT_CONNECTED;
     }
     SDL_CameraSpec cam_spec{};
@@ -314,6 +396,22 @@ s32 PS4_SYSV_ABI sceCameraStart(s32 handle, OrbisCameraStartParameter* param) {
     cam_spec.width = c_width;
     cam_spec.framerate_numerator = 60;
     cam_spec.framerate_denominator = 1;
+    g_host_is_ps_camera = false;
+    s32 format_count = 0;
+    if (SDL_CameraSpec** formats =
+            SDL_GetCameraSupportedFormats(devices[EmulatorSettings.GetCameraId()], &format_count)) {
+        for (s32 i = 0; i < format_count; ++i) {
+            if (formats[i]->width == static_cast<int>(c_ps_camera_width) &&
+                formats[i]->height == static_cast<int>(c_ps_camera_height)) {
+                g_host_is_ps_camera = true;
+                cam_spec.width = c_ps_camera_width;
+                cam_spec.height = c_ps_camera_height;
+                LOG_INFO(Lib_Camera, "Host camera is a PlayStation Camera, using both sensors");
+                break;
+            }
+        }
+        SDL_free(formats);
+    }
     sdl_camera = SDL_OpenCamera(devices[EmulatorSettings.GetCameraId()], &cam_spec);
 
     if (!sdl_camera) {

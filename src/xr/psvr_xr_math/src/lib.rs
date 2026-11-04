@@ -19,7 +19,7 @@
 
 mod math;
 
-pub use math::{Fov, OrbisFov, Pose, Quat, TrackingSpace, Vec3};
+pub use math::{Fov, MoveState, OrbisFov, Pose, Quat, TrackingSpace, Vec3};
 
 macro_rules! deref_or_return {
     ($($name:ident),+) => {
@@ -109,6 +109,35 @@ pub unsafe extern "C" fn pxm_pose_apply_local_offset(
     deref_or_return!(pose);
     deref_mut_or_return!(out);
     *out = pose.apply_local_offset(offset);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pxm_move_from_grip(
+    grip: *const Pose,
+    angular_velocity: Vec3,
+    out: *mut MoveState,
+) {
+    deref_or_return!(grip);
+    deref_mut_or_return!(out);
+    *out = math::move_from_grip(grip, angular_velocity);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pxm_orbis_pose_to_xr(
+    space: *const TrackingSpace,
+    orbis: *const Pose,
+    out: *mut Pose,
+) {
+    deref_or_return!(space, orbis);
+    deref_mut_or_return!(out);
+    *out = space.pose_to_xr(orbis);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pxm_fov_from_uv_block(block: *const [f32; 4], out: *mut Fov) {
+    deref_or_return!(block);
+    deref_mut_or_return!(out);
+    *out = math::fov_from_uv_block(*block);
 }
 
 #[cfg(test)]

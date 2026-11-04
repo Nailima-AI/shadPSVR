@@ -39,7 +39,7 @@ cmake_dependent_option(ENABLE_SYSTEM_VULKAN "Enable the system Vulkan driver" OF
 option(ENABLE_DISCORD_RPC "Enable the Discord RPC integration" ON)
 option(ENABLE_UPDATER "Enables the options to updater" ON)
 option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
-option(ENABLE_OPENXR "Drive PSVR titles through an OpenXR runtime (requires cargo)" OFF)
+option(ENABLE_OPENXR "Drive PSVR titles through an OpenXR runtime" OFF)
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
 
 # First, determine whether to use CMAKE_OSX_ARCHITECTURES or CMAKE_SYSTEM_PROCESSOR.
@@ -1204,6 +1204,7 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_platform.cpp
                src/video_core/renderer_vulkan/vk_platform.h
                src/video_core/renderer_vulkan/vk_presenter.cpp
+               src/video_core/renderer_vulkan/vk_presenter_xr.cpp
                src/video_core/renderer_vulkan/vk_presenter.h
                src/video_core/renderer_vulkan/vk_rasterizer.cpp
                src/video_core/renderer_vulkan/vk_rasterizer.h
@@ -1480,33 +1481,34 @@ add_compile_definitions(BOOST_ASIO_STANDALONE)
 target_include_directories(shadps4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(shadps4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/xr/psvr_xr_math/include)
 
-if (ENABLE_OPENXR)
-    find_program(CARGO_EXECUTABLE cargo REQUIRED)
-    set(PSVR_XR_MATH_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/xr/psvr_xr_math)
-    set(PSVR_XR_MATH_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/psvr_xr_math)
-    if (WIN32)
-        set(PSVR_XR_MATH_LIB ${PSVR_XR_MATH_TARGET_DIR}/release/psvr_xr_math.lib)
-    else()
-        set(PSVR_XR_MATH_LIB ${PSVR_XR_MATH_TARGET_DIR}/release/libpsvr_xr_math.a)
-    endif()
-    file(GLOB PSVR_XR_MATH_SOURCES CONFIGURE_DEPENDS ${PSVR_XR_MATH_DIR}/src/*.rs)
-    add_custom_command(
-        OUTPUT ${PSVR_XR_MATH_LIB}
-        COMMAND ${CARGO_EXECUTABLE} build --release --lib
-                --manifest-path ${PSVR_XR_MATH_DIR}/Cargo.toml
-                --target-dir ${PSVR_XR_MATH_TARGET_DIR}
-        DEPENDS ${PSVR_XR_MATH_SOURCES} ${PSVR_XR_MATH_DIR}/Cargo.toml
-        COMMENT "Building psvr_xr_math (Rust)"
-        VERBATIM)
-    add_custom_target(psvr_xr_math_build DEPENDS ${PSVR_XR_MATH_LIB})
-    add_library(psvr_xr_math STATIC IMPORTED GLOBAL)
-    set_target_properties(psvr_xr_math PROPERTIES IMPORTED_LOCATION ${PSVR_XR_MATH_LIB})
-    add_dependencies(psvr_xr_math psvr_xr_math_build)
-    if (WIN32)
-        set_property(TARGET psvr_xr_math APPEND PROPERTY INTERFACE_LINK_LIBRARIES ws2_32 userenv ntdll bcrypt)
-    endif()
+find_program(CARGO_EXECUTABLE cargo REQUIRED)
+set(PSVR_XR_MATH_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/xr/psvr_xr_math)
+set(PSVR_XR_MATH_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/psvr_xr_math)
+if (WIN32)
+    set(PSVR_XR_MATH_LIB ${PSVR_XR_MATH_TARGET_DIR}/release/psvr_xr_math.lib)
+else()
+    set(PSVR_XR_MATH_LIB ${PSVR_XR_MATH_TARGET_DIR}/release/libpsvr_xr_math.a)
+endif()
+file(GLOB PSVR_XR_MATH_SOURCES CONFIGURE_DEPENDS ${PSVR_XR_MATH_DIR}/src/*.rs)
+add_custom_command(
+    OUTPUT ${PSVR_XR_MATH_LIB}
+    COMMAND ${CARGO_EXECUTABLE} build --release --lib
+            --manifest-path ${PSVR_XR_MATH_DIR}/Cargo.toml
+            --target-dir ${PSVR_XR_MATH_TARGET_DIR}
+    DEPENDS ${PSVR_XR_MATH_SOURCES} ${PSVR_XR_MATH_DIR}/Cargo.toml
+    COMMENT "Building psvr_xr_math (Rust)"
+    VERBATIM)
+add_custom_target(psvr_xr_math_build DEPENDS ${PSVR_XR_MATH_LIB})
+add_library(psvr_xr_math STATIC IMPORTED GLOBAL)
+set_target_properties(psvr_xr_math PROPERTIES IMPORTED_LOCATION ${PSVR_XR_MATH_LIB})
+add_dependencies(psvr_xr_math psvr_xr_math_build)
+if (WIN32)
+    set_property(TARGET psvr_xr_math APPEND PROPERTY INTERFACE_LINK_LIBRARIES ws2_32 userenv ntdll bcrypt)
+endif()
+target_link_libraries(shadps4 PRIVATE psvr_xr_math)
 
-    target_link_libraries(shadps4 PRIVATE psvr_xr_math OpenXR::openxr_loader)
+if (ENABLE_OPENXR)
+    target_link_libraries(shadps4 PRIVATE OpenXR::openxr_loader)
     target_compile_definitions(shadps4 PRIVATE ENABLE_OPENXR)
 endif()
 

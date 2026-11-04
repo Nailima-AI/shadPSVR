@@ -5,27 +5,91 @@
 #include "core/libraries/error_codes.h"
 #include "core/libraries/hmd/hmd.h"
 #include "core/libraries/hmd/hmd_error.h"
+#include "core/libraries/kernel/equeue.h"
 #include "core/libraries/libs.h"
+#include "core/xr/openxr_runtime.h"
+#include "video_core/amdgpu/liverpool.h"
+#include "video_core/amdgpu/resource.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
+
+#include <array>
+#include <cstring>
+#include <mutex>
+
+extern std::unique_ptr<Vulkan::Presenter> presenter;
+extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
+
+namespace Libraries::Kernel {
+int PS4_SYSV_ABI sceKernelTriggerUserEvent(OrbisKernelEqueue eq, int id, void* udata);
+}
 
 namespace Libraries::Hmd {
+
+static bool g_reprojection_initialized = false;
+static std::mutex g_event_mutex;
+static std::array<std::pair<s64, s32>, 2> g_user_events{{{-1, -1}, {-1, -1}}};
+
+static void TriggerCompositorEvents() {
+    std::scoped_lock lock{g_event_mutex};
+    for (const auto [equeue, id] : g_user_events) {
+        if (equeue != -1) {
+            Libraries::Kernel::sceKernelTriggerUserEvent(equeue, id, nullptr);
+        }
+    }
+}
+
+static AmdGpu::Image ReadTextureSharp(const void* sharp) {
+    AmdGpu::Image image{};
+    std::memcpy(&image, sharp, sizeof(image));
+    return image;
+}
+
+static s32 SubmitStereo(const OrbisHmdReprojectionFrameParam* param,
+                        const OrbisHmdReprojectionPose* pose) {
+    if (param == nullptr || pose == nullptr || param->left_texture == nullptr ||
+        param->right_texture == nullptr) {
+        return ORBIS_HMD_ERROR_PARAMETER_NULL;
+    }
+    if (!Core::Xr::Runtime::Instance().IsHeadsetActive()) {
+        return ORBIS_OK;
+    }
+
+    const std::array eyes{ReadTextureSharp(param->left_texture),
+                          ReadTextureSharp(param->right_texture)};
+    Core::Xr::EyeSubmission submission{};
+    std::memcpy(&submission.head.position, pose->position, sizeof(pose->position));
+    std::memcpy(&submission.head.orientation, pose->orientation, sizeof(pose->orientation));
+    const float* blocks[2] = {param->fov_left, param->fov_right};
+    for (u32 eye = 0; eye < 2; ++eye) {
+        pxm_fov_from_uv_block(blocks[eye], &submission.fov[eye]);
+        submission.width[eye] = static_cast<u32>(eyes[eye].width) + 1;
+        submission.height[eye] = static_cast<u32>(eyes[eye].height) + 1;
+    }
+    liverpool->SendCommand([eyes, submission]() { presenter->SubmitXrEyes(eyes, submission); });
+    return ORBIS_OK;
+}
 
 s32 PS4_SYSV_ABI sceHmdReprojectionStartMultilayer() {
     LOG_ERROR(Lib_Hmd, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceHmdReprojectionAddDisplayBuffer() {
-    LOG_ERROR(Lib_Hmd, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceHmdReprojectionAddDisplayBuffer(s32 index, void* reserved) {
+    LOG_INFO(Lib_Hmd, "called, index = {}", index);
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceHmdReprojectionClearUserEventEnd() {
-    LOG_ERROR(Lib_Hmd, "(STUBBED) called");
+    LOG_INFO(Lib_Hmd, "called");
+    std::scoped_lock lock{g_event_mutex};
+    g_user_events[1] = {-1, -1};
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceHmdReprojectionClearUserEventStart() {
-    LOG_ERROR(Lib_Hmd, "(STUBBED) called");
+    LOG_INFO(Lib_Hmd, "called");
+    std::scoped_lock lock{g_event_mutex};
+    g_user_events[0] = {-1, -1};
     return ORBIS_OK;
 }
 
@@ -40,7 +104,9 @@ s32 PS4_SYSV_ABI sceHmdReprojectionDebugGetLastInfoMultilayer() {
 }
 
 s32 PS4_SYSV_ABI sceHmdReprojectionFinalize() {
-    LOG_ERROR(Lib_Hmd, "(STUBBED) called");
+    LOG_INFO(Lib_Hmd, "called");
+    Core::Xr::Runtime::Instance().SetFrameCallback(nullptr);
+    g_reprojection_initialized = false;
     return ORBIS_OK;
 }
 
@@ -49,8 +115,18 @@ s32 PS4_SYSV_ABI sceHmdReprojectionFinalizeCapture() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceHmdReprojectionInitialize() {
-    LOG_ERROR(Lib_Hmd, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceHmdReprojectionInitialize(const OrbisHmdReprojectionInitParam* param, u32 type,
+                                              void* reserved) {
+    LOG_INFO(Lib_Hmd, "called, type = {}", type);
+    if (param == nullptr || param->onion_buffer == nullptr || param->garlic_buffer == nullptr) {
+        return ORBIS_HMD_ERROR_PARAMETER_NULL;
+    }
+    if (param->onion_buffer == param->garlic_buffer || param->cpu_mask > 0x3f ||
+        param->pipe_id > 6 || param->queue_id > 7 || type > 2) {
+        return ORBIS_HMD_ERROR_PARAMETER_INVALID;
+    }
+    Core::Xr::Runtime::Instance().SetFrameCallback(TriggerCompositorEvents);
+    g_reprojection_initialized = true;
     return ORBIS_OK;
 }
 
@@ -80,8 +156,13 @@ s32 PS4_SYSV_ABI sceHmdReprojectionSetCallback() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceHmdReprojectionSetDisplayBuffers() {
-    LOG_ERROR(Lib_Hmd, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceHmdReprojectionSetDisplayBuffers(s32 video_out_handle, s32 index_a, s32 index_b,
+                                                     void* reserved) {
+    LOG_INFO(Lib_Hmd, "called, video_out_handle = {}, buffers = {}, {}", video_out_handle, index_a,
+             index_b);
+    if (index_a == index_b) {
+        return ORBIS_HMD_ERROR_PARAMETER_INVALID;
+    }
     return ORBIS_OK;
 }
 
@@ -90,23 +171,37 @@ s32 PS4_SYSV_ABI sceHmdReprojectionSetOutputMinColor() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceHmdReprojectionSetUserEventEnd() {
-    LOG_ERROR(Lib_Hmd, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceHmdReprojectionSetUserEventEnd(s64 equeue, s32 id) {
+    LOG_INFO(Lib_Hmd, "called, id = {}", id);
+    std::scoped_lock lock{g_event_mutex};
+    g_user_events[1] = {equeue, id};
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceHmdReprojectionSetUserEventStart() {
-    LOG_ERROR(Lib_Hmd, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceHmdReprojectionSetUserEventStart(s64 equeue, s32 id) {
+    LOG_INFO(Lib_Hmd, "called, id = {}", id);
+    std::scoped_lock lock{g_event_mutex};
+    g_user_events[0] = {equeue, id};
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceHmdReprojectionStart() {
-    LOG_ERROR(Lib_Hmd, "(STUBBED) called");
-    return ORBIS_OK;
+s32 PS4_SYSV_ABI sceHmdReprojectionStart(const OrbisHmdReprojectionFrameParam* param,
+                                         const OrbisHmdReprojectionPose* pose, u64 frame,
+                                         void* reserved) {
+    LOG_TRACE(Lib_Hmd, "called, frame = {}", frame);
+    return SubmitStereo(param, pose);
 }
 
-s32 PS4_SYSV_ABI sceHmdReprojectionStart2dVr() {
-    LOG_ERROR(Lib_Hmd, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceHmdReprojectionStart2dVr(const OrbisHmdReprojection2dParam* param, u64 frame,
+                                             void* reserved) {
+    static bool logged = false;
+    if (!logged) {
+        LOG_WARNING(Lib_Hmd, "2D VR screens are not shown in the headset yet");
+        logged = true;
+    }
+    if (param == nullptr || param->texture == nullptr) {
+        return ORBIS_HMD_ERROR_PARAMETER_NULL;
+    }
     return ORBIS_OK;
 }
 
@@ -135,9 +230,15 @@ s32 PS4_SYSV_ABI sceHmdReprojectionStartWideNearWithOverlay() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceHmdReprojectionStartWithOverlay() {
-    LOG_ERROR(Lib_Hmd, "(STUBBED) called");
-    return ORBIS_OK;
+s32 PS4_SYSV_ABI sceHmdReprojectionStartWithOverlay(const OrbisHmdReprojectionFrameParam* param,
+                                                    const OrbisHmdReprojectionPose* pose, u64 frame,
+                                                    const void* overlay, void* reserved) {
+    static bool logged = false;
+    if (!logged) {
+        LOG_WARNING(Lib_Hmd, "Reprojection overlays are ignored");
+        logged = true;
+    }
+    return SubmitStereo(param, pose);
 }
 
 s32 PS4_SYSV_ABI sceHmdReprojectionStop() {

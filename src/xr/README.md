@@ -6,10 +6,11 @@ Drives PSVR (PS4) titles with any OpenXR headset, e.g. SteamVR. Off by default.
 
 | Piece | Language | Role |
 | --- | --- | --- |
-| `src/xr/psvr_xr_math` | Rust (staticlib, C ABI) | Pose/FOV/eye-offset math, recentering. Unit tested with `cargo test`. |
-| `src/core/xr/openxr_runtime.*` | C++ | OpenXR instance + session on shadPS4's own Vulkan device, frame loop thread, tracking snapshots. |
+| `src/xr/psvr_xr_math` | Rust (staticlib, C ABI) | Pose/FOV/eye-offset math, recentering, eye-texture FOV blocks, PS Move frame and IMU. `cargo test`. |
+| `src/core/xr/openxr_runtime.*` | C++ | OpenXR instance + session on shadPS4's Vulkan device, frame loop, controller actions, haptics, eye swapchains, projection layer. |
 | `src/core/xr/openxr_runtime_stub.cpp` | C++ | Used when `ENABLE_OPENXR=OFF`; everything reports "no headset". |
-| `libSceHmd`, `libSceVrTracker` | C++ | Report a connected headset and return real poses, FOV and eye offsets. |
+| `src/video_core/renderer_vulkan/vk_presenter_xr.cpp` | C++ | Draws the title's eye textures into the OpenXR swapchains. |
+| `libSceHmd`, `libSceVrTracker`, `libSceMove`, `libSceCamera` | C++ | HLE backed by the above. |
 
 ## Build and run
 
@@ -19,20 +20,44 @@ cmake --build build
 SHADPS4_OPENXR=1 ./build/shadps4 <game>
 ```
 
-Needs `cargo` on PATH. Start SteamVR (or another OpenXR runtime) first.
+Needs `cargo` and Clang 19+. Start SteamVR (or another OpenXR runtime) first.
 
 ## Status
 
-- [x] Step 1: OpenXR session bound to shadPS4's Vulkan device, head pose streaming.
-- [x] Step 2 (first pass): `sceHmdGetDeviceInformation`, `sceHmdGetFieldOfView`,
-      `sceHmdGet2DEyeOffset`, `sceVrTrackerGetResult` (HMD) backed by OpenXR.
-- [ ] Step 3: eye-buffer submit (`sceHmdReprojection*` → OpenXR swapchain), and finding out
-      whether titles pre-distort.
-- [ ] Step 4: PS Move ↔ SteamVR controllers.
+- [x] Head tracking: `sceHmdGetDeviceInformation`, `sceHmdGetFieldOfView`, `sceHmdGet2DEyeOffset`,
+      `sceVrTrackerGetResult` (HMD).
+- [x] Display: `sceHmdReprojectionStart` / `StartWithOverlay` eye textures → OpenXR projection
+      layer, rendered with the pose the title used. The runtime does reprojection and lens
+      distortion. User events registered with `SetUserEventStart/End` fire once per headset frame.
+- [x] PS Move: two SteamVR controllers as Move 0 (right hand) and Move 1 (left hand), buttons,
+      trigger, IMU, rumble, and sphere poses through `sceVrTrackerGetResult`.
+- [x] DualShock 4 pose (experimental): midpoint of the two controllers.
+- [x] Camera: a virtual PlayStation Camera when no host camera is selected; webcam or real PS
+      Camera passthrough otherwise. See [CAMERA.md](CAMERA.md).
+- [ ] `sceHmdReprojectionStart2dVr` (cinematic 2D screen) and multilayer submits: logged, not shown.
+- [ ] Social screen on a separate VideoOut bus (PS VR Worlds asserts in `sceVideoOutOpen`).
 
-## Known gaps
+## Controller mapping
 
-- Nothing is shown in the headset yet: the frame loop ends every frame with zero layers.
-- The Orbis tracking origin is the head position at session start (or last recenter). Real
-  PSVR positions are relative to the PS Camera; some titles may expect an offset.
-- The PSVR camera (`sceCamera*`) is still unimplemented; titles that gate on it will stall.
+| Move | Index | Touch | Vive |
+| --- | --- | --- | --- |
+| Cross / Circle | A / B | A,X / B,Y | – |
+| Square | trackpad press | thumbstick click | – |
+| Triangle | grip squeeze | grip | grip |
+| Move button | thumbstick click | – | trackpad click |
+| T | trigger | trigger | trigger |
+| Start / Select | – | left menu / – | left menu / right menu |
+
+Rebind in SteamVR's controller settings for the "psvr" action set.
+
+## Known gaps and guesses
+
+- Untested on a commercial title. Verified only against Monado's simulated headset.
+- The Orbis origin is the head position at session start (or last recenter). Real PSVR positions
+  are relative to the PS Camera; some titles may expect an offset.
+- `label` in the reprojection frame parameters is never written. If a title waits on it, it will
+  stall.
+- Move sphere offset (9 cm from the grip) and the Move axis convention (+Y along the shaft) come
+  from psmoveapi and PS3 libgem; PS4 may differ.
+- Struct layouts for the reprojection calls come from ALVR-PS4's hardware notes
+  (github.com/nicolas-riera/ALVR-PS4, `docs/psvr-technical-reference.md`).

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -77,6 +79,34 @@ struct Runtime::Impl {
     std::atomic<bool> stop_requested{false};
     std::atomic<bool> recenter_requested{true};
     std::jthread frame_thread;
+
+    struct InputActions {
+        XrActionSet set{XR_NULL_HANDLE};
+        XrAction grip_pose{XR_NULL_HANDLE};
+        XrAction trigger{XR_NULL_HANDLE};
+        XrAction haptic{XR_NULL_HANDLE};
+        std::array<XrAction, 7> buttons{};
+        XrPath hand_paths[2]{XR_NULL_PATH, XR_NULL_PATH};
+        XrSpace grip_spaces[2]{XR_NULL_HANDLE, XR_NULL_HANDLE};
+    } input;
+    std::atomic<float> vibration[2]{0.0f, 0.0f};
+    float applied_vibration[2]{0.0f, 0.0f};
+    std::chrono::steady_clock::time_point vibration_refresh[2]{};
+
+    struct EyeSwapchain {
+        XrSwapchain handle{XR_NULL_HANDLE};
+        u32 width{};
+        u32 height{};
+        std::vector<VkImage> images;
+    };
+    s64 swapchain_format{};
+    mutable std::mutex layer_mutex;
+    std::array<EyeSwapchain, 2> eye_swapchains{};
+    bool layer_ready{false};
+    XrCompositionLayerProjectionView layer_views[2]{};
+
+    std::mutex callback_mutex;
+    std::function<void()> frame_callback;
 
     mutable std::mutex state_mutex;
     PxmTrackingSpace tracking_space{};
@@ -178,6 +208,304 @@ struct Runtime::Impl {
         }
     }
 
+    XrPath ToPath(const char* path) const {
+        XrPath out = XR_NULL_PATH;
+        Check(xrStringToPath(instance, path, &out), path);
+        return out;
+    }
+
+    bool CreateAction(const char* name, const char* localized, XrActionType type,
+                      XrAction& action) {
+        XrActionCreateInfo info{
+            .type = XR_TYPE_ACTION_CREATE_INFO,
+            .actionType = type,
+            .countSubactionPaths = 2,
+            .subactionPaths = input.hand_paths,
+        };
+        std::strncpy(info.actionName, name, XR_MAX_ACTION_NAME_SIZE - 1);
+        std::strncpy(info.localizedActionName, localized, XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
+        return Check(xrCreateAction(input.set, &info, &action), name);
+    }
+
+    struct Binding {
+        XrAction InputActions::*action;
+        s32 button;
+        const char* path;
+    };
+
+    void SuggestBindings(const char* profile, std::initializer_list<Binding> bindings) {
+        std::vector<XrActionSuggestedBinding> suggested;
+        for (const auto& binding : bindings) {
+            const XrAction action =
+                binding.button >= 0 ? input.buttons[binding.button] : input.*binding.action;
+            suggested.push_back({action, ToPath(binding.path)});
+        }
+        const XrInteractionProfileSuggestedBinding info{
+            .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
+            .interactionProfile = ToPath(profile),
+            .countSuggestedBindings = static_cast<u32>(suggested.size()),
+            .suggestedBindings = suggested.data(),
+        };
+        Check(xrSuggestInteractionProfileBindings(instance, &info), profile);
+    }
+
+    bool CreateInput() {
+        input.hand_paths[0] = ToPath("/user/hand/left");
+        input.hand_paths[1] = ToPath("/user/hand/right");
+
+        XrActionSetCreateInfo set_info{.type = XR_TYPE_ACTION_SET_CREATE_INFO};
+        std::strncpy(set_info.actionSetName, "psvr", XR_MAX_ACTION_SET_NAME_SIZE - 1);
+        std::strncpy(set_info.localizedActionSetName, "PlayStation VR",
+                     XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE - 1);
+        if (!Check(xrCreateActionSet(instance, &set_info, &input.set), "xrCreateActionSet")) {
+            return false;
+        }
+
+        static constexpr std::array<std::pair<const char*, const char*>, 7> button_names{{
+            {"cross", "Cross"},
+            {"circle", "Circle"},
+            {"square", "Square"},
+            {"triangle", "Triangle"},
+            {"move", "Move button"},
+            {"start", "Start"},
+            {"select", "Select"},
+        }};
+        bool ok = CreateAction("grip_pose", "Move controller pose", XR_ACTION_TYPE_POSE_INPUT,
+                               input.grip_pose) &&
+                  CreateAction("trigger", "T trigger", XR_ACTION_TYPE_FLOAT_INPUT, input.trigger) &&
+                  CreateAction("rumble", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT, input.haptic);
+        for (size_t i = 0; ok && i < button_names.size(); ++i) {
+            ok = CreateAction(button_names[i].first, button_names[i].second,
+                              XR_ACTION_TYPE_BOOLEAN_INPUT, input.buttons[i]);
+        }
+        if (!ok) {
+            return false;
+        }
+
+        enum : s32 { Cross, Circle, Square, Triangle, MoveButton, Start, Select, None = -1 };
+        constexpr auto pose = &InputActions::grip_pose;
+        constexpr auto trigger = &InputActions::trigger;
+        constexpr auto haptic = &InputActions::haptic;
+        SuggestBindings("/interaction_profiles/khr/simple_controller",
+                        {
+                            {pose, None, "/user/hand/left/input/grip/pose"},
+                            {pose, None, "/user/hand/right/input/grip/pose"},
+                            {trigger, None, "/user/hand/left/input/select/click"},
+                            {trigger, None, "/user/hand/right/input/select/click"},
+                            {nullptr, Start, "/user/hand/left/input/menu/click"},
+                            {nullptr, Start, "/user/hand/right/input/menu/click"},
+                            {haptic, None, "/user/hand/left/output/haptic"},
+                            {haptic, None, "/user/hand/right/output/haptic"},
+                        });
+        SuggestBindings("/interaction_profiles/valve/index_controller",
+                        {
+                            {pose, None, "/user/hand/left/input/grip/pose"},
+                            {pose, None, "/user/hand/right/input/grip/pose"},
+                            {trigger, None, "/user/hand/left/input/trigger/value"},
+                            {trigger, None, "/user/hand/right/input/trigger/value"},
+                            {nullptr, Cross, "/user/hand/left/input/a/click"},
+                            {nullptr, Cross, "/user/hand/right/input/a/click"},
+                            {nullptr, Circle, "/user/hand/left/input/b/click"},
+                            {nullptr, Circle, "/user/hand/right/input/b/click"},
+                            {nullptr, Square, "/user/hand/left/input/trackpad/force"},
+                            {nullptr, Square, "/user/hand/right/input/trackpad/force"},
+                            {nullptr, Triangle, "/user/hand/left/input/squeeze/force"},
+                            {nullptr, Triangle, "/user/hand/right/input/squeeze/force"},
+                            {nullptr, MoveButton, "/user/hand/left/input/thumbstick/click"},
+                            {nullptr, MoveButton, "/user/hand/right/input/thumbstick/click"},
+                            {haptic, None, "/user/hand/left/output/haptic"},
+                            {haptic, None, "/user/hand/right/output/haptic"},
+                        });
+        SuggestBindings("/interaction_profiles/oculus/touch_controller",
+                        {
+                            {pose, None, "/user/hand/left/input/grip/pose"},
+                            {pose, None, "/user/hand/right/input/grip/pose"},
+                            {trigger, None, "/user/hand/left/input/trigger/value"},
+                            {trigger, None, "/user/hand/right/input/trigger/value"},
+                            {nullptr, Cross, "/user/hand/left/input/x/click"},
+                            {nullptr, Cross, "/user/hand/right/input/a/click"},
+                            {nullptr, Circle, "/user/hand/left/input/y/click"},
+                            {nullptr, Circle, "/user/hand/right/input/b/click"},
+                            {nullptr, Square, "/user/hand/left/input/thumbstick/click"},
+                            {nullptr, Square, "/user/hand/right/input/thumbstick/click"},
+                            {nullptr, Triangle, "/user/hand/left/input/squeeze/value"},
+                            {nullptr, Triangle, "/user/hand/right/input/squeeze/value"},
+                            {nullptr, Start, "/user/hand/left/input/menu/click"},
+                            {haptic, None, "/user/hand/left/output/haptic"},
+                            {haptic, None, "/user/hand/right/output/haptic"},
+                        });
+        SuggestBindings("/interaction_profiles/htc/vive_controller",
+                        {
+                            {pose, None, "/user/hand/left/input/grip/pose"},
+                            {pose, None, "/user/hand/right/input/grip/pose"},
+                            {trigger, None, "/user/hand/left/input/trigger/value"},
+                            {trigger, None, "/user/hand/right/input/trigger/value"},
+                            {nullptr, MoveButton, "/user/hand/left/input/trackpad/click"},
+                            {nullptr, MoveButton, "/user/hand/right/input/trackpad/click"},
+                            {nullptr, Triangle, "/user/hand/left/input/squeeze/click"},
+                            {nullptr, Triangle, "/user/hand/right/input/squeeze/click"},
+                            {nullptr, Start, "/user/hand/left/input/menu/click"},
+                            {nullptr, Select, "/user/hand/right/input/menu/click"},
+                            {haptic, None, "/user/hand/left/output/haptic"},
+                            {haptic, None, "/user/hand/right/output/haptic"},
+                        });
+
+        for (int hand = 0; hand < 2; ++hand) {
+            const XrActionSpaceCreateInfo space_info{
+                .type = XR_TYPE_ACTION_SPACE_CREATE_INFO,
+                .action = input.grip_pose,
+                .subactionPath = input.hand_paths[hand],
+                .poseInActionSpace = IdentityPose,
+            };
+            if (!Check(xrCreateActionSpace(session, &space_info, &input.grip_spaces[hand]),
+                       "xrCreateActionSpace")) {
+                return false;
+            }
+        }
+        const XrSessionActionSetsAttachInfo attach_info{
+            .type = XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO,
+            .countActionSets = 1,
+            .actionSets = &input.set,
+        };
+        return Check(xrAttachSessionActionSets(session, &attach_info), "xrAttachSessionActionSets");
+    }
+
+    void DestroyInput() {
+        for (auto& space : input.grip_spaces) {
+            if (space != XR_NULL_HANDLE) {
+                xrDestroySpace(space);
+                space = XR_NULL_HANDLE;
+            }
+        }
+        if (input.set != XR_NULL_HANDLE) {
+            xrDestroyActionSet(input.set);
+        }
+        input = {};
+    }
+
+    bool SyncInput() {
+        if (input.set == XR_NULL_HANDLE || session_state != XR_SESSION_STATE_FOCUSED) {
+            return false;
+        }
+        const XrActiveActionSet active{input.set, XR_NULL_PATH};
+        const XrActionsSyncInfo sync_info{
+            .type = XR_TYPE_ACTIONS_SYNC_INFO,
+            .countActiveActionSets = 1,
+            .activeActionSets = &active,
+        };
+        return XR_SUCCEEDED(xrSyncActions(session, &sync_info));
+    }
+
+    void ReadController(int hand, XrTime display_time, ControllerSnapshot& out,
+                        XrSpaceLocation& location, XrSpaceVelocity& velocity) {
+        XrActionStateGetInfo get_info{
+            .type = XR_TYPE_ACTION_STATE_GET_INFO,
+            .subactionPath = input.hand_paths[hand],
+        };
+        for (size_t i = 0; i < input.buttons.size(); ++i) {
+            get_info.action = input.buttons[i];
+            XrActionStateBoolean state{.type = XR_TYPE_ACTION_STATE_BOOLEAN};
+            if (XR_SUCCEEDED(xrGetActionStateBoolean(session, &get_info, &state)) &&
+                state.isActive && state.currentState) {
+                out.buttons |= 1u << i;
+            }
+        }
+        get_info.action = input.trigger;
+        XrActionStateFloat trigger{.type = XR_TYPE_ACTION_STATE_FLOAT};
+        if (XR_SUCCEEDED(xrGetActionStateFloat(session, &get_info, &trigger)) && trigger.isActive) {
+            out.trigger = trigger.currentState;
+        }
+
+        velocity = {.type = XR_TYPE_SPACE_VELOCITY};
+        location = {.type = XR_TYPE_SPACE_LOCATION, .next = &velocity};
+        xrLocateSpace(input.grip_spaces[hand], local_space, display_time, &location);
+    }
+
+    void ApplyVibration() {
+        if (input.haptic == XR_NULL_HANDLE) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        for (int hand = 0; hand < 2; ++hand) {
+            const float amplitude = vibration[hand].load();
+            const XrHapticActionInfo info{
+                .type = XR_TYPE_HAPTIC_ACTION_INFO,
+                .action = input.haptic,
+                .subactionPath = input.hand_paths[hand],
+            };
+            if (amplitude <= 0.0f) {
+                if (applied_vibration[hand] > 0.0f) {
+                    xrStopHapticFeedback(session, &info);
+                    applied_vibration[hand] = 0.0f;
+                }
+                continue;
+            }
+            if (amplitude == applied_vibration[hand] && now < vibration_refresh[hand]) {
+                continue;
+            }
+            const XrHapticVibration haptic{
+                .type = XR_TYPE_HAPTIC_VIBRATION,
+                .duration = 500'000'000,
+                .frequency = XR_FREQUENCY_UNSPECIFIED,
+                .amplitude = amplitude,
+            };
+            xrApplyHapticFeedback(session, &info,
+                                  reinterpret_cast<const XrHapticBaseHeader*>(&haptic));
+            applied_vibration[hand] = amplitude;
+            vibration_refresh[hand] = now + std::chrono::milliseconds(400);
+        }
+    }
+
+    void ChooseSwapchainFormat() {
+        u32 count = 0;
+        if (!Check(xrEnumerateSwapchainFormats(session, 0, &count, nullptr),
+                   "xrEnumerateSwapchainFormats") ||
+            count == 0) {
+            return;
+        }
+        std::vector<s64> formats(count);
+        if (!Check(xrEnumerateSwapchainFormats(session, count, &count, formats.data()),
+                   "xrEnumerateSwapchainFormats")) {
+            return;
+        }
+        constexpr std::array preferred = {static_cast<s64>(VK_FORMAT_R8G8B8A8_SRGB),
+                                          static_cast<s64>(VK_FORMAT_B8G8R8A8_SRGB)};
+        for (const s64 format : preferred) {
+            if (std::ranges::find(formats, format) != formats.end()) {
+                swapchain_format = format;
+                return;
+            }
+        }
+        swapchain_format = formats.front();
+        LOG_WARNING(Lib_Hmd, "OpenXR runtime offers no sRGB swapchain, using format {}",
+                    swapchain_format);
+    }
+
+    void DestroySwapchains() {
+        std::scoped_lock lock{layer_mutex, Vulkan::Scheduler::submit_mutex};
+        for (auto& swapchain : eye_swapchains) {
+            if (swapchain.handle != XR_NULL_HANDLE) {
+                xrDestroySwapchain(swapchain.handle);
+            }
+            swapchain = {};
+        }
+        layer_ready = false;
+    }
+
+    std::optional<XrCompositionLayerProjection> BuildProjectionLayer(
+        XrCompositionLayerProjectionView (&views)[2]) {
+        if (!layer_ready) {
+            return std::nullopt;
+        }
+        std::memcpy(views, layer_views, sizeof(views));
+        return XrCompositionLayerProjection{
+            .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION,
+            .space = local_space,
+            .viewCount = 2,
+            .views = views,
+        };
+    }
+
     void SampleTracking(XrTime display_time) {
         XrSpaceVelocity velocity{.type = XR_TYPE_SPACE_VELOCITY};
         XrSpaceLocation head_location{.type = XR_TYPE_SPACE_LOCATION, .next = &velocity};
@@ -212,6 +540,15 @@ struct Runtime::Impl {
         const PxmPose xr_eyes[2] = {ToPxm(views[0].pose), ToPxm(views[1].pose)};
 
         TrackingSnapshot next{};
+        XrSpaceLocation hand_locations[2]{};
+        XrSpaceVelocity hand_velocities[2]{};
+        if (SyncInput()) {
+            for (int hand = 0; hand < 2; ++hand) {
+                ReadController(hand, display_time, next.hands[hand], hand_locations[hand],
+                               hand_velocities[hand]);
+            }
+            ApplyVibration();
+        }
         for (int eye = 0; eye < 2; ++eye) {
             pxm_eye_offset(&xr_head, &xr_eyes[eye], &next.eye_offsets[eye]);
         }
@@ -235,12 +572,32 @@ struct Runtime::Impl {
             pxm_xr_vector_to_orbis(&tracking_space, ToPxm(velocity.angularVelocity),
                                    &next.angular_velocity);
         }
+        for (int hand = 0; hand < 2; ++hand) {
+            auto& controller = next.hands[hand];
+            const auto& location = hand_locations[hand];
+            const auto& hand_velocity = hand_velocities[hand];
+            controller.pose_valid = (location.locationFlags & pose_valid) == pose_valid;
+            if (!controller.pose_valid) {
+                continue;
+            }
+            const PxmPose grip = ToPxm(location.pose);
+            pxm_xr_pose_to_orbis(&tracking_space, &grip, &controller.grip);
+            controller.has_velocity =
+                (hand_velocity.velocityFlags & velocity_valid) == velocity_valid;
+            if (controller.has_velocity) {
+                pxm_xr_vector_to_orbis(&tracking_space, ToPxm(hand_velocity.linearVelocity),
+                                       &controller.linear_velocity);
+                pxm_xr_vector_to_orbis(&tracking_space, ToPxm(hand_velocity.angularVelocity),
+                                       &controller.angular_velocity);
+            }
+        }
         snapshot = next;
     }
 
-    // Until eye buffers are submitted this loop ends every frame with no layers, which keeps
-    // the session focused and the runtime predicting poses. The runtime may touch the
-    // graphics queue inside these calls, so they share the scheduler's submit lock.
+    // Ends every headset frame with the most recent eye images, or no layers before the title
+    // submits any, which keeps the session focused and the runtime predicting poses. The
+    // runtime may touch the graphics queue inside these calls, so they share the scheduler's
+    // submit lock.
     void FrameLoop(std::stop_token stop) {
         while (!stop.stop_requested() && !stop_requested) {
             PollEvents();
@@ -254,6 +611,12 @@ struct Runtime::Impl {
                 continue;
             }
             {
+                std::scoped_lock lock{callback_mutex};
+                if (frame_callback) {
+                    frame_callback();
+                }
+            }
+            {
                 std::scoped_lock lock{Vulkan::Scheduler::submit_mutex};
                 if (!Check(xrBeginFrame(session, nullptr), "xrBeginFrame")) {
                     continue;
@@ -262,14 +625,23 @@ struct Runtime::Impl {
             if (frame_state.shouldRender) {
                 SampleTracking(frame_state.predictedDisplayTime);
             }
+            std::scoped_lock lock{layer_mutex, Vulkan::Scheduler::submit_mutex};
+            XrCompositionLayerProjectionView views[2]{};
+            std::optional<XrCompositionLayerProjection> projection;
+            if (frame_state.shouldRender) {
+                projection = BuildProjectionLayer(views);
+            }
+            const XrCompositionLayerBaseHeader* layers[] = {
+                reinterpret_cast<const XrCompositionLayerBaseHeader*>(projection ? &*projection
+                                                                                 : nullptr),
+            };
             const XrFrameEndInfo end_info{
                 .type = XR_TYPE_FRAME_END_INFO,
                 .displayTime = frame_state.predictedDisplayTime,
                 .environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
-                .layerCount = 0,
-                .layers = nullptr,
+                .layerCount = projection ? 1u : 0u,
+                .layers = projection ? layers : nullptr,
             };
-            std::scoped_lock lock{Vulkan::Scheduler::submit_mutex};
             Check(xrEndFrame(session, &end_info), "xrEndFrame");
         }
         session_running = false;
@@ -280,6 +652,8 @@ struct Runtime::Impl {
             frame_thread.request_stop();
             frame_thread.join();
         }
+        DestroyInput();
+        DestroySwapchains();
         if (view_space != XR_NULL_HANDLE) {
             xrDestroySpace(view_space);
             view_space = XR_NULL_HANDLE;
@@ -445,6 +819,12 @@ bool Runtime::CreateSession(VkInstance instance, VkPhysicalDevice physical_devic
         return false;
     }
 
+    impl->ChooseSwapchainFormat();
+    if (!impl->CreateInput()) {
+        LOG_ERROR(Lib_Hmd, "OpenXR controller input unavailable");
+        impl->DestroyInput();
+    }
+
     impl->stop_requested = false;
     impl->frame_thread = std::jthread{[this](std::stop_token stop) { impl->FrameLoop(stop); }};
     LOG_INFO(Lib_Hmd, "OpenXR session created");
@@ -471,6 +851,143 @@ std::optional<TrackingSnapshot> Runtime::GetTrackingSnapshot() const {
 
 void Runtime::Recenter() {
     impl->recenter_requested = true;
+}
+
+void Runtime::SetVibration(Hand hand, float amplitude) {
+    impl->vibration[static_cast<u32>(hand)] = std::clamp(amplitude, 0.0f, 1.0f);
+}
+
+void Runtime::SetFrameCallback(std::function<void()> callback) {
+    std::scoped_lock lock{impl->callback_mutex};
+    impl->frame_callback = std::move(callback);
+}
+
+s64 Runtime::GetSwapchainFormat() const {
+    return impl->session != XR_NULL_HANDLE ? impl->swapchain_format : 0;
+}
+
+bool Runtime::EnsureEyeSwapchains(const u32 width[2], const u32 height[2]) {
+    if (impl->session == XR_NULL_HANDLE || impl->swapchain_format == 0) {
+        return false;
+    }
+    {
+        std::scoped_lock lock{impl->layer_mutex};
+        bool matches = true;
+        for (u32 eye = 0; eye < 2; ++eye) {
+            const auto& swapchain = impl->eye_swapchains[eye];
+            matches &= swapchain.handle != XR_NULL_HANDLE && swapchain.width == width[eye] &&
+                       swapchain.height == height[eye];
+        }
+        if (matches) {
+            return false;
+        }
+    }
+    impl->DestroySwapchains();
+
+    std::scoped_lock lock{impl->layer_mutex, Vulkan::Scheduler::submit_mutex};
+    for (u32 eye = 0; eye < 2; ++eye) {
+        auto& swapchain = impl->eye_swapchains[eye];
+        const XrSwapchainCreateInfo info{
+            .type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
+            .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT,
+            .format = impl->swapchain_format,
+            .sampleCount = 1,
+            .width = width[eye],
+            .height = height[eye],
+            .faceCount = 1,
+            .arraySize = 1,
+            .mipCount = 1,
+        };
+        if (!impl->Check(xrCreateSwapchain(impl->session, &info, &swapchain.handle),
+                         "xrCreateSwapchain")) {
+            swapchain = {};
+            return false;
+        }
+        u32 count = 0;
+        xrEnumerateSwapchainImages(swapchain.handle, 0, &count, nullptr);
+        std::vector<XrSwapchainImageVulkanKHR> images(count,
+                                                      {.type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+        impl->Check(xrEnumerateSwapchainImages(
+                        swapchain.handle, count, &count,
+                        reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())),
+                    "xrEnumerateSwapchainImages");
+        swapchain.width = width[eye];
+        swapchain.height = height[eye];
+        for (const auto& image : images) {
+            swapchain.images.push_back(image.image);
+        }
+    }
+    LOG_INFO(Lib_Hmd, "OpenXR eye swapchains: {}x{} and {}x{}", width[0], height[0], width[1],
+             height[1]);
+    return true;
+}
+
+std::vector<VkImage_T*> Runtime::GetEyeSwapchainImages(u32 eye) const {
+    std::scoped_lock lock{impl->layer_mutex};
+    return impl->eye_swapchains[eye].images;
+}
+
+std::optional<u32> Runtime::AcquireEyeImage(u32 eye) {
+    XrSwapchain swapchain;
+    {
+        std::scoped_lock lock{impl->layer_mutex};
+        swapchain = impl->eye_swapchains[eye].handle;
+    }
+    if (swapchain == XR_NULL_HANDLE) {
+        return std::nullopt;
+    }
+    u32 index = 0;
+    {
+        std::scoped_lock lock{Vulkan::Scheduler::submit_mutex};
+        if (!impl->Check(xrAcquireSwapchainImage(swapchain, nullptr, &index),
+                         "xrAcquireSwapchainImage")) {
+            return std::nullopt;
+        }
+    }
+    const XrSwapchainImageWaitInfo wait_info{
+        .type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,
+        .timeout = 1'000'000'000,
+    };
+    if (xrWaitSwapchainImage(swapchain, &wait_info) != XR_SUCCESS) {
+        LOG_ERROR(Lib_Hmd, "OpenXR swapchain image wait timed out");
+        return std::nullopt;
+    }
+    return index;
+}
+
+void Runtime::ReleaseEyeImage(u32 eye) {
+    std::scoped_lock lock{impl->layer_mutex, Vulkan::Scheduler::submit_mutex};
+    const XrSwapchain swapchain = impl->eye_swapchains[eye].handle;
+    if (swapchain != XR_NULL_HANDLE) {
+        impl->Check(xrReleaseSwapchainImage(swapchain, nullptr), "xrReleaseSwapchainImage");
+    }
+}
+
+void Runtime::PublishEyes(const EyeSubmission& submission) {
+    PxmPose head_xr{};
+    {
+        std::scoped_lock lock{impl->state_mutex};
+        pxm_orbis_pose_to_xr(&impl->tracking_space, &submission.head, &head_xr);
+    }
+    const auto snapshot = GetTrackingSnapshot();
+    std::scoped_lock lock{impl->layer_mutex};
+    for (u32 eye = 0; eye < 2; ++eye) {
+        PxmPose eye_pose = head_xr;
+        if (snapshot) {
+            pxm_pose_apply_local_offset(&head_xr, snapshot->eye_offsets[eye], &eye_pose);
+        }
+        auto& view = impl->layer_views[eye];
+        view = {.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+        std::memcpy(&view.pose, &eye_pose, sizeof(view.pose));
+        view.fov = {submission.fov[eye].angle_left, submission.fov[eye].angle_right,
+                    submission.fov[eye].angle_up, submission.fov[eye].angle_down};
+        view.subImage.swapchain = impl->eye_swapchains[eye].handle;
+        view.subImage.imageRect = {
+            {0, 0},
+            {static_cast<s32>(submission.width[eye]), static_cast<s32>(submission.height[eye])}};
+    }
+    impl->layer_ready = impl->eye_swapchains[0].handle != XR_NULL_HANDLE &&
+                        impl->eye_swapchains[1].handle != XR_NULL_HANDLE;
 }
 
 } // namespace Core::Xr

@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/camera/camera.h"
+#include "core/libraries/camera/camera_helpers.h"
 
 namespace Libraries::Camera {
 
@@ -379,7 +380,7 @@ s32 PS4_SYSV_ABI sceCameraSetConfig(s32 handle, OrbisCameraConfig* config) {
         LOG_ERROR(Lib_Camera, "ORBIS_CAMERA_ERROR_NOT_OPEN");
         return ORBIS_CAMERA_ERROR_NOT_OPEN;
     }
-    if (EmulatorSettings.GetCameraId() == -1) {
+    if (!IsCameraConnected()) {
         LOG_ERROR(Lib_Camera, "ORBIS_CAMERA_ERROR_NOT_CONNECTED");
         return ORBIS_CAMERA_ERROR_NOT_CONNECTED;
     }
@@ -486,7 +487,7 @@ s32 PS4_SYSV_ABI sceCameraSetExposureGain(s32 handle, OrbisCameraChannel channel
     if (!g_library_opened) {
         return ORBIS_CAMERA_ERROR_NOT_OPEN;
     }
-    if (EmulatorSettings.GetCameraId() == -1) {
+    if (!IsCameraConnected()) {
         return ORBIS_CAMERA_ERROR_NOT_CONNECTED;
     }
 

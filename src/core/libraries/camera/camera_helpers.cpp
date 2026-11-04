@@ -1,9 +1,58 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
+
 #include "camera_helpers.h"
+#include "core/emulator_settings.h"
+#include "core/xr/openxr_runtime.h"
 
 namespace Libraries::Camera {
+
+CameraBackend GetCameraBackend() {
+    if (EmulatorSettings.GetCameraId() != -1) {
+        return CameraBackend::Host;
+    }
+    if (Core::Xr::Runtime::Instance().IsRequested()) {
+        return CameraBackend::Virtual;
+    }
+    return CameraBackend::Disconnected;
+}
+
+bool IsCameraConnected() {
+    return GetCameraBackend() != CameraBackend::Disconnected;
+}
+
+void ScaleYUY2(const u8* src, u32 src_pitch, u32 src_width, u32 src_height, u8* dst, u32 dst_width,
+               u32 dst_height) {
+    const u32 src_pairs = src_width / 2;
+    const u32 dst_pairs = dst_width / 2;
+    if (src_pairs == 0 || src_height == 0) {
+        FillBlackYUY2(dst, dst_width, dst_height);
+        return;
+    }
+    for (u32 y = 0; y < dst_height; ++y) {
+        const u8* src_row = src + static_cast<u64>(y * src_height / dst_height) * src_pitch;
+        u8* dst_row = dst + static_cast<u64>(y) * dst_width * 2;
+        if (src_pairs == dst_pairs) {
+            std::memcpy(dst_row, src_row, dst_width * 2);
+            continue;
+        }
+        for (u32 pair = 0; pair < dst_pairs; ++pair) {
+            std::memcpy(dst_row + pair * 4, src_row + (pair * src_pairs / dst_pairs) * 4, 4);
+        }
+    }
+}
+
+void FillBlackYUY2(u8* dst, u32 width, u32 height) {
+    const u64 pairs = static_cast<u64>(width / 2) * height;
+    for (u64 i = 0; i < pairs; ++i) {
+        dst[i * 4 + 0] = 16;
+        dst[i * 4 + 1] = 128;
+        dst[i * 4 + 2] = 16;
+        dst[i * 4 + 3] = 128;
+    }
+}
 
 static inline u8 ClampU8(int v) {
     return static_cast<u8>(v < 0 ? 0 : (v > 255 ? 255 : v));

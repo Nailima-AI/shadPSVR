@@ -294,6 +294,68 @@ pub fn fov_to_orbis(left: &Fov, right: &Fov) -> OrbisFov {
     }
 }
 
+impl TrackingSpace {
+    /// Inverse of [`TrackingSpace::pose_to_orbis`].
+    pub fn pose_to_xr(&self, orbis: &Pose) -> Pose {
+        let yaw = self.recenter_yaw_inverse.conjugate();
+        Pose {
+            orientation: (yaw * orbis.orientation.normalized()).normalized(),
+            position: self.recenter_origin + yaw.rotate(orbis.position - self.orbis_origin),
+        }
+    }
+}
+
+/// Field of view covered by an eye texture handed to sceHmdReprojectionStart.
+/// The block maps tangents to texture coordinates, `uv = tan * scale + offset`, with x to the
+/// right and y downwards, as `{scale_x, scale_y, offset_x, offset_y}`.
+pub fn fov_from_uv_block(block: [f32; 4]) -> Fov {
+    let [scale_x, scale_y, offset_x, offset_y] = block;
+    if scale_x == 0.0 || scale_y == 0.0 || !block.iter().all(|v| v.is_finite()) {
+        return Fov::default();
+    }
+    let tan_at = |uv: f32, scale: f32, offset: f32| (uv - offset) / scale;
+    Fov {
+        angle_left: tan_at(0.0, scale_x, offset_x).atan(),
+        angle_right: tan_at(1.0, scale_x, offset_x).atan(),
+        angle_up: (-tan_at(0.0, scale_y, offset_y)).atan(),
+        angle_down: (-tan_at(1.0, scale_y, offset_y)).atan(),
+    }
+}
+
+/// Output of [`move_from_grip`]: what libSceMove and libSceVrTracker report for a PS Move.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MoveState {
+    /// Sphere centre, oriented in the Move's own frame (+Y along the shaft toward the sphere).
+    pub sphere: Pose,
+    /// Accelerometer in g, device frame. Gravity only: OpenXR does not report acceleration.
+    pub accelerometer: Vec3,
+    /// Gyro in rad/s, device frame.
+    pub gyro: Vec3,
+}
+
+/// Distance from the OpenXR grip origin (centre of the fist) to the Move's sphere centre.
+pub const MOVE_SPHERE_OFFSET: f32 = 0.09;
+
+/// Rotates Move-local axes into grip-local axes. OpenXR grip -Z runs out of the fist along the
+/// controller, which is the Move's shaft (+Y), and grip +Y is the button face (+Z on the Move).
+pub fn move_from_grip_rotation() -> Quat {
+    Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), -std::f32::consts::FRAC_PI_2)
+}
+
+pub fn move_from_grip(grip: &Pose, angular_velocity: Vec3) -> MoveState {
+    let orientation = (grip.orientation.normalized() * move_from_grip_rotation()).normalized();
+    let inverse = orientation.conjugate();
+    MoveState {
+        sphere: Pose {
+            orientation,
+            position: grip.position + orientation.rotate(Vec3::new(0.0, MOVE_SPHERE_OFFSET, 0.0)),
+        },
+        accelerometer: inverse.rotate(Vec3::new(0.0, 1.0, 0.0)),
+        gyro: inverse.rotate(angular_velocity),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +529,83 @@ mod tests {
     }
 
     #[test]
+    fn upright_move_reads_one_g_up() {
+        // Controller held upright: the grip's -Z (out of the fist) points at the ceiling.
+        let grip = Pose {
+            orientation: Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), FRAC_PI_2),
+            position: Vec3::new(0.2, 1.0, -0.3),
+        };
+        let state = move_from_grip(&grip, Vec3::ZERO);
+        approx_v(state.accelerometer, Vec3::new(0.0, 1.0, 0.0));
+        approx_v(
+            state.sphere.position,
+            Vec3::new(0.2, 1.0 + MOVE_SPHERE_OFFSET, -0.3),
+        );
+        approx_q(state.sphere.orientation, Quat::IDENTITY);
+    }
+
+    #[test]
+    fn move_pointing_forward_has_sphere_ahead() {
+        let state = move_from_grip(&Pose::IDENTITY, Vec3::ZERO);
+        approx_v(
+            state.sphere.position,
+            Vec3::new(0.0, 0.0, -MOVE_SPHERE_OFFSET),
+        );
+        // Lying flat, buttons up: gravity reaction comes out of the button face (+Z).
+        approx_v(state.accelerometer, Vec3::new(0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn gyro_is_device_local() {
+        let grip = Pose {
+            orientation: Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), FRAC_PI_2),
+            position: Vec3::ZERO,
+        };
+        // Upright Move spinning about world up spins about its own shaft (+Y).
+        let state = move_from_grip(&grip, Vec3::new(0.0, 2.0, 0.0));
+        approx_v(state.gyro, Vec3::new(0.0, 2.0, 0.0));
+    }
+
+    #[test]
+    fn pose_to_xr_inverts_pose_to_orbis() {
+        let mut space = TrackingSpace::new(Vec3::new(0.0, 0.0, 1.5));
+        space.recenter(&Pose {
+            orientation: Quat::from_axis_angle(UP, 0.8),
+            position: Vec3::new(1.0, 1.7, -2.0),
+        });
+        let xr = Pose {
+            orientation: Quat::from_axis_angle(Vec3::new(1.0, 2.0, 0.5), 0.6),
+            position: Vec3::new(0.3, 1.2, 0.4),
+        };
+        let back = space.pose_to_xr(&space.pose_to_orbis(&xr));
+        approx_v(back.position, xr.position);
+        approx_q(back.orientation, xr.orientation);
+    }
+
+    #[test]
+    fn uv_block_round_trips_tangents() {
+        // ALVR-PS4's construction for an image covering the given tangents.
+        let (left, right, up, down) = (1.2f32, 0.9f32, 1.1f32, 1.3f32);
+        let block = [
+            1.0 / (left + right),
+            1.0 / (up + down),
+            left / (left + right),
+            up / (up + down),
+        ];
+        let fov = fov_from_uv_block(block);
+        assert!((fov.angle_left - (-left).atan()).abs() < EPS);
+        assert!((fov.angle_right - right.atan()).abs() < EPS);
+        assert!((fov.angle_up - up.atan()).abs() < EPS);
+        assert!((fov.angle_down - (-down).atan()).abs() < EPS);
+    }
+
+    #[test]
+    fn degenerate_uv_block_is_empty() {
+        assert_eq!(fov_from_uv_block([0.0; 4]), Fov::default());
+        assert_eq!(fov_from_uv_block([f32::NAN, 1.0, 0.0, 0.0]), Fov::default());
+    }
+
+    #[test]
     fn layouts_match_c_header() {
         assert_eq!(std::mem::size_of::<Vec3>(), 12);
         assert_eq!(std::mem::size_of::<Quat>(), 16);
@@ -475,5 +614,6 @@ mod tests {
         assert_eq!(std::mem::size_of::<Fov>(), 16);
         assert_eq!(std::mem::size_of::<OrbisFov>(), 16);
         assert_eq!(std::mem::size_of::<TrackingSpace>(), 40);
+        assert_eq!(std::mem::size_of::<MoveState>(), 52);
     }
 }

@@ -25,6 +25,7 @@ static bool IsXrHeadsetActive() {
 static void FillConnectedDeviceInformation(OrbisHmdDeviceInformation* info) {
     info->status = OrbisHmdDeviceStatus::ORBIS_HMD_DEVICE_STATUS_READY;
     info->device_info.panel_resolution = {1920, 1080};
+    info->device_info.flip_to_display_latency = {5555, 4160};
     info->hmu_mount = 1;
 }
 

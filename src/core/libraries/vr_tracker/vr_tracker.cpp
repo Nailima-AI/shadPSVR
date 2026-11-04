@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstring>
+#include <iterator>
 
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/move/move.h"
 #include "core/libraries/vr_tracker/vr_tracker.h"
 #include "core/libraries/vr_tracker/vr_tracker_error.h"
 #include "core/memory.h"
@@ -27,7 +30,7 @@ static u32 g_work_size = 0;
 
 // Registered handles
 static s32 g_pad_handle = -1;
-static s32 g_move_handle = -1;
+static s32 g_move_handles[2] = {-1, -1};
 static s32 g_gun_handle = -1;
 static s32 g_hmd_handle = -1;
 
@@ -45,23 +48,67 @@ static void FillPose(OrbisVrTrackerPoseData& out, const PxmPose& pose) {
     out.orientation_w = pose.orientation.w;
 }
 
-static void FillHmdResult(const Core::Xr::TrackingSnapshot& snapshot,
-                          OrbisVrTrackerResultData* result) {
+static bool IsMoveHandleRegistered(s32 handle) {
+    return handle != -1 && std::ranges::find(g_move_handles, handle) != std::end(g_move_handles);
+}
+
+static void FillTrackedCommon(u64 timestamp, OrbisVrTrackerResultData* result) {
     result->connected = 1;
-    result->timestamp = snapshot.timestamp_us;
-    result->device_timestamp = snapshot.timestamp_us;
+    result->timestamp = timestamp;
+    result->device_timestamp = timestamp;
     result->status = ORBIS_VR_TRACKER_STATUS_TRACKING;
     result->position_quality = ORBIS_VR_TRACKER_QUALITY_FULL;
     result->orientation_quality = ORBIS_VR_TRACKER_QUALITY_FULL;
-    if (snapshot.has_velocity) {
-        result->velocity_x = snapshot.linear_velocity.x;
-        result->velocity_y = snapshot.linear_velocity.y;
-        result->velocity_z = snapshot.linear_velocity.z;
-        result->angular_velocity_x = snapshot.angular_velocity.x;
-        result->angular_velocity_y = snapshot.angular_velocity.y;
-        result->angular_velocity_z = snapshot.angular_velocity.z;
+}
+
+static void FillVelocity(const PxmVec3& linear, const PxmVec3& angular,
+                         OrbisVrTrackerResultData* result) {
+    result->velocity_x = linear.x;
+    result->velocity_y = linear.y;
+    result->velocity_z = linear.z;
+    result->angular_velocity_x = angular.x;
+    result->angular_velocity_y = angular.y;
+    result->angular_velocity_z = angular.z;
+}
+
+static bool FillMoveResult(const Core::Xr::TrackingSnapshot& snapshot, s32 handle,
+                           OrbisVrTrackerResultData* result) {
+    const s32 hand = Libraries::Move::GetMoveHandIndex(handle);
+    if (hand < 0 || !snapshot.hands[hand].pose_valid) {
+        return false;
     }
-    result->camera_orientation_w = 1.0f;
+    const auto& controller = snapshot.hands[hand];
+    PxmMoveState state{};
+    pxm_move_from_grip(&controller.grip, PxmVec3{}, &state);
+    FillTrackedCommon(snapshot.timestamp_us, result);
+    if (controller.has_velocity) {
+        FillVelocity(controller.linear_velocity, controller.angular_velocity, result);
+    }
+    FillPose(result->move_info.device_pose, state.sphere);
+    return true;
+}
+
+// A DualShock 4 held in both hands sits between the two controllers.
+static bool FillPadResult(const Core::Xr::TrackingSnapshot& snapshot,
+                          OrbisVrTrackerResultData* result) {
+    const auto& left = snapshot.hands[static_cast<u32>(Core::Xr::Hand::Left)];
+    const auto& right = snapshot.hands[static_cast<u32>(Core::Xr::Hand::Right)];
+    if (!left.pose_valid || !right.pose_valid) {
+        return false;
+    }
+    PxmPose pad{};
+    pxm_head_from_views(&left.grip, &right.grip, &pad);
+    FillTrackedCommon(snapshot.timestamp_us, result);
+    FillPose(result->pad_info.device_pose, pad);
+    return true;
+}
+
+static void FillHmdResult(const Core::Xr::TrackingSnapshot& snapshot,
+                          OrbisVrTrackerResultData* result) {
+    FillTrackedCommon(snapshot.timestamp_us, result);
+    if (snapshot.has_velocity) {
+        FillVelocity(snapshot.linear_velocity, snapshot.angular_velocity, result);
+    }
     FillPose(result->hmd_info.device_pose, snapshot.head);
     FillPose(result->hmd_info.head_pose, snapshot.head);
     FillPose(result->hmd_info.left_eye_pose, snapshot.eyes[0]);
@@ -225,10 +272,14 @@ s32 PS4_SYSV_ABI sceVrTrackerRegisterDeviceInternal(const OrbisVrTrackerDeviceTy
         break;
     }
     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_MOVE: {
-        if (g_move_handle != -1) {
+        if (IsMoveHandleRegistered(handle)) {
             return ORBIS_VR_TRACKER_ERROR_DEVICE_ALREADY_REGISTERED;
         }
-        g_move_handle = handle;
+        s32* slot = std::ranges::find(g_move_handles, -1);
+        if (slot == std::end(g_move_handles)) {
+            return ORBIS_VR_TRACKER_ERROR_DEVICE_ALREADY_REGISTERED;
+        }
+        *slot = handle;
         break;
     }
     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_GUN: {
@@ -272,15 +323,22 @@ s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param
     result->handle = handle;
     result->user_frame_number = param->user_frame_number;
 
-    if (handle != -1 && handle == g_hmd_handle) {
-        if (const auto snapshot = Core::Xr::Runtime::Instance().GetTrackingSnapshot()) {
+    result->camera_orientation_w = 1.0f;
+    if (const auto snapshot = Core::Xr::Runtime::Instance().GetTrackingSnapshot();
+        snapshot && handle != -1) {
+        if (handle == g_hmd_handle) {
             FillHmdResult(*snapshot, result);
+            return ORBIS_OK;
+        }
+        if (IsMoveHandleRegistered(handle) && FillMoveResult(*snapshot, handle, result)) {
+            return ORBIS_OK;
+        }
+        if (handle == g_pad_handle && FillPadResult(*snapshot, result)) {
             return ORBIS_OK;
         }
     }
 
     result->status = ORBIS_VR_TRACKER_STATUS_NOT_TRACKING;
-    result->camera_orientation_w = 1.0f;
     return ORBIS_OK;
 }
 
@@ -372,7 +430,7 @@ s32 PS4_SYSV_ABI sceVrTrackerRecalibrate(const OrbisVrTrackerRecalibrateParam* p
         break;
     }
     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_MOVE: {
-        if (g_move_handle == -1) {
+        if (std::ranges::count(g_move_handles, -1) == std::size(g_move_handles)) {
             return ORBIS_VR_TRACKER_ERROR_DEVICE_NOT_REGISTERED;
         }
         break;
@@ -537,8 +595,8 @@ s32 PS4_SYSV_ABI sceVrTrackerUnregisterDevice(const s32 handle) {
         g_hmd_handle = -1;
     } else if (handle == g_pad_handle) {
         g_pad_handle = -1;
-    } else if (handle == g_move_handle) {
-        g_move_handle = -1;
+    } else if (IsMoveHandleRegistered(handle)) {
+        *std::ranges::find(g_move_handles, handle) = -1;
     } else if (handle == g_gun_handle) {
         g_gun_handle = -1;
     } else {

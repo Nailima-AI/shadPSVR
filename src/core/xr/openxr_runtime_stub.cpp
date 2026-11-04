@@ -58,4 +58,28 @@ std::optional<TrackingSnapshot> Runtime::GetTrackingSnapshot() const {
 
 void Runtime::Recenter() {}
 
+void Runtime::SetVibration(Hand, float) {}
+
+void Runtime::SetFrameCallback(std::function<void()>) {}
+
+s64 Runtime::GetSwapchainFormat() const {
+    return 0;
+}
+
+bool Runtime::EnsureEyeSwapchains(const u32*, const u32*) {
+    return false;
+}
+
+std::vector<VkImage_T*> Runtime::GetEyeSwapchainImages(u32) const {
+    return {};
+}
+
+std::optional<u32> Runtime::AcquireEyeImage(u32) {
+    return std::nullopt;
+}
+
+void Runtime::ReleaseEyeImage(u32) {}
+
+void Runtime::PublishEyes(const EyeSubmission&) {}
+
 } // namespace Core::Xr

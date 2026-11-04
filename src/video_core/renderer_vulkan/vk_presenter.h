@@ -6,6 +6,7 @@
 #include <condition_variable>
 
 #include "core/libraries/videoout/buffer.h"
+#include "core/xr/openxr_runtime.h"
 #include "imgui/imgui_texture.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
@@ -101,6 +102,9 @@ public:
     void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true);
     Frame* PrepareLastFrame();
 
+    void SubmitXrEyes(const std::array<AmdGpu::Image, 2>& eyes,
+                      const Core::Xr::EyeSubmission& submission);
+
 private:
     Frame* GetRenderFrame();
 
@@ -136,6 +140,9 @@ private:
     std::condition_variable_any frame_cv;
     std::optional<ImGui::RefCountedTexture> splash_img;
     std::vector<VAddr> vo_buffers_addr;
+    HostPasses::PostProcessingPass xr_pp_pass;
+    bool xr_pp_created{false};
+    std::array<std::vector<vk::UniqueImageView>, 2> xr_views;
 };
 
 } // namespace Vulkan

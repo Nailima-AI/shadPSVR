@@ -12,6 +12,17 @@ class SymbolsResolver;
 
 namespace Libraries::Move {
 
+enum OrbisMoveButton : u16 {
+    ORBIS_MOVE_BUTTON_SELECT = 1 << 0,
+    ORBIS_MOVE_BUTTON_T = 1 << 1,
+    ORBIS_MOVE_BUTTON_MOVE = 1 << 2,
+    ORBIS_MOVE_BUTTON_START = 1 << 3,
+    ORBIS_MOVE_BUTTON_TRIANGLE = 1 << 4,
+    ORBIS_MOVE_BUTTON_CIRCLE = 1 << 5,
+    ORBIS_MOVE_BUTTON_CROSS = 1 << 6,
+    ORBIS_MOVE_BUTTON_SQUARE = 1 << 7,
+};
+
 struct OrbisMoveDeviceInfo {
     float sphere_radius;
     float accelerometer_offset[3];
@@ -42,6 +53,9 @@ struct OrbisMoveData {
     s32 count;
     float temperature;
 };
+
+// Returns the OpenXR hand (0 = left, 1 = right) backing a Move handle, or -1.
+s32 GetMoveHandIndex(s32 handle);
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 } // namespace Libraries::Move

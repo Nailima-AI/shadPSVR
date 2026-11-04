@@ -66,34 +66,94 @@ struct OrbisHmdEyeOffset {
     u8 reserve[20];
 };
 
+// Layouts follow libSceHmd's parameter checks as documented by ALVR-PS4.
+struct OrbisHmdReprojectionInitParam {
+    void* onion_buffer;
+    void* garlic_buffer;
+    u64 thread_priority;
+    u64 cpu_mask;
+    u32 pipe_id;
+    u32 queue_id;
+    u32 reserved0;
+    u32 reserved1;
+    u64 reserved2;
+};
+static_assert(sizeof(OrbisHmdReprojectionInitParam) == 0x38);
+
+struct OrbisHmdReprojectionFrameParam {
+    const void* left_texture;
+    const void* right_texture;
+    const void* sampler;
+    float fov_left[4];
+    float fov_right[4];
+    void* label;
+    u32 time_us;
+    u32 pad0;
+    u64 unk9;
+    u32 mode;
+    u32 pad1;
+    u64 flags;
+    u64 reserved[4];
+};
+static_assert(sizeof(OrbisHmdReprojectionFrameParam) == 0x80);
+
+struct OrbisHmdReprojectionPose {
+    float position[3];
+    float orientation[4];
+    u32 pad0;
+    u64 timestamp;
+    u64 unk28;
+    u32 unk30;
+    u32 pad1;
+};
+static_assert(sizeof(OrbisHmdReprojectionPose) == 0x38);
+
+struct OrbisHmdReprojection2dParam {
+    const void* texture;
+    const void* sampler;
+    float uv_transform[4];
+    void* label;
+    u32 time_us;
+    u32 pad0;
+    u64 reserved[4];
+};
+static_assert(sizeof(OrbisHmdReprojection2dParam) == 0x50);
+
 // Reprojection
 s32 PS4_SYSV_ABI sceHmdReprojectionStartMultilayer();
-s32 PS4_SYSV_ABI sceHmdReprojectionAddDisplayBuffer();
+s32 PS4_SYSV_ABI sceHmdReprojectionAddDisplayBuffer(s32 index, void* reserved);
 s32 PS4_SYSV_ABI sceHmdReprojectionClearUserEventEnd();
 s32 PS4_SYSV_ABI sceHmdReprojectionClearUserEventStart();
 s32 PS4_SYSV_ABI sceHmdReprojectionDebugGetLastInfo();
 s32 PS4_SYSV_ABI sceHmdReprojectionDebugGetLastInfoMultilayer();
 s32 PS4_SYSV_ABI sceHmdReprojectionFinalize();
 s32 PS4_SYSV_ABI sceHmdReprojectionFinalizeCapture();
-s32 PS4_SYSV_ABI sceHmdReprojectionInitialize();
+s32 PS4_SYSV_ABI sceHmdReprojectionInitialize(const OrbisHmdReprojectionInitParam* param, u32 type,
+                                              void* reserved);
 s32 PS4_SYSV_ABI sceHmdReprojectionInitializeCapture();
 s32 PS4_SYSV_ABI sceHmdReprojectionQueryGarlicBuffAlign();
 s32 PS4_SYSV_ABI sceHmdReprojectionQueryGarlicBuffSize();
 s32 PS4_SYSV_ABI sceHmdReprojectionQueryOnionBuffAlign();
 s32 PS4_SYSV_ABI sceHmdReprojectionQueryOnionBuffSize();
 s32 PS4_SYSV_ABI sceHmdReprojectionSetCallback();
-s32 PS4_SYSV_ABI sceHmdReprojectionSetDisplayBuffers();
+s32 PS4_SYSV_ABI sceHmdReprojectionSetDisplayBuffers(s32 video_out_handle, s32 index_a, s32 index_b,
+                                                     void* reserved);
 s32 PS4_SYSV_ABI sceHmdReprojectionSetOutputMinColor();
-s32 PS4_SYSV_ABI sceHmdReprojectionSetUserEventEnd();
-s32 PS4_SYSV_ABI sceHmdReprojectionSetUserEventStart();
-s32 PS4_SYSV_ABI sceHmdReprojectionStart();
-s32 PS4_SYSV_ABI sceHmdReprojectionStart2dVr();
+s32 PS4_SYSV_ABI sceHmdReprojectionSetUserEventEnd(s64 equeue, s32 id);
+s32 PS4_SYSV_ABI sceHmdReprojectionSetUserEventStart(s64 equeue, s32 id);
+s32 PS4_SYSV_ABI sceHmdReprojectionStart(const OrbisHmdReprojectionFrameParam* param,
+                                         const OrbisHmdReprojectionPose* pose, u64 frame,
+                                         void* reserved);
+s32 PS4_SYSV_ABI sceHmdReprojectionStart2dVr(const OrbisHmdReprojection2dParam* param, u64 frame,
+                                             void* reserved);
 s32 PS4_SYSV_ABI sceHmdReprojectionStartCapture();
 s32 PS4_SYSV_ABI sceHmdReprojectionStartLiveCapture();
 s32 PS4_SYSV_ABI sceHmdReprojectionStartMultilayer2();
 s32 PS4_SYSV_ABI sceHmdReprojectionStartWideNear();
 s32 PS4_SYSV_ABI sceHmdReprojectionStartWideNearWithOverlay();
-s32 PS4_SYSV_ABI sceHmdReprojectionStartWithOverlay();
+s32 PS4_SYSV_ABI sceHmdReprojectionStartWithOverlay(const OrbisHmdReprojectionFrameParam* param,
+                                                    const OrbisHmdReprojectionPose* pose, u64 frame,
+                                                    const void* overlay, void* reserved);
 s32 PS4_SYSV_ABI sceHmdReprojectionStop();
 s32 PS4_SYSV_ABI sceHmdReprojectionStopCapture();
 s32 PS4_SYSV_ABI sceHmdReprojectionStopLiveCapture();

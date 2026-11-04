@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -13,8 +14,31 @@
 struct VkInstance_T;
 struct VkPhysicalDevice_T;
 struct VkDevice_T;
+struct VkImage_T;
 
 namespace Core::Xr {
+
+enum ControllerButton : u32 {
+    CONTROLLER_BUTTON_CROSS = 1u << 0,
+    CONTROLLER_BUTTON_CIRCLE = 1u << 1,
+    CONTROLLER_BUTTON_SQUARE = 1u << 2,
+    CONTROLLER_BUTTON_TRIANGLE = 1u << 3,
+    CONTROLLER_BUTTON_MOVE = 1u << 4,
+    CONTROLLER_BUTTON_START = 1u << 5,
+    CONTROLLER_BUTTON_SELECT = 1u << 6,
+};
+
+enum class Hand : u32 { Left = 0, Right = 1 };
+
+struct ControllerSnapshot {
+    bool pose_valid;
+    PxmPose grip;
+    PxmVec3 linear_velocity;
+    PxmVec3 angular_velocity;
+    bool has_velocity;
+    u32 buttons;
+    float trigger;
+};
 
 // All poses are already in the Orbis tracking space.
 struct TrackingSnapshot {
@@ -25,7 +49,16 @@ struct TrackingSnapshot {
     PxmVec3 linear_velocity;
     PxmVec3 angular_velocity;
     bool has_velocity;
+    ControllerSnapshot hands[2];
     u64 timestamp_us;
+};
+
+// One stereo frame handed over by sceHmdReprojectionStart.
+struct EyeSubmission {
+    PxmPose head;
+    PxmFov fov[2];
+    u32 width[2];
+    u32 height[2];
 };
 
 class Runtime {
@@ -50,6 +83,18 @@ public:
     bool IsHeadsetActive() const;
     std::optional<TrackingSnapshot> GetTrackingSnapshot() const;
     void Recenter();
+    void SetVibration(Hand hand, float amplitude);
+
+    // Called once per headset frame from the frame loop, right after xrWaitFrame.
+    void SetFrameCallback(std::function<void()> callback);
+
+    // Eye swapchains. All of these are called from the GPU thread.
+    s64 GetSwapchainFormat() const;
+    bool EnsureEyeSwapchains(const u32 width[2], const u32 height[2]);
+    std::vector<VkImage_T*> GetEyeSwapchainImages(u32 eye) const;
+    std::optional<u32> AcquireEyeImage(u32 eye);
+    void ReleaseEyeImage(u32 eye);
+    void PublishEyes(const EyeSubmission& submission);
 
     ~Runtime();
 

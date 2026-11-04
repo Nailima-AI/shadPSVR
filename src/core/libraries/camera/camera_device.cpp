@@ -3,6 +3,7 @@
 
 #include "common/logging/log.h"
 #include "core/libraries/camera/camera.h"
+#include "core/libraries/camera/camera_helpers.h"
 
 namespace Libraries::Camera {
 
@@ -55,8 +56,12 @@ s32 PS4_SYSV_ABI sceCameraGetDeviceInfo(s32 reserved, OrbisCameraDeviceInfo* dev
     if (!g_library_opened) {
         return ORBIS_CAMERA_ERROR_NOT_INIT;
     }
+    if (!IsCameraConnected()) {
+        return ORBIS_CAMERA_ERROR_NOT_CONNECTED;
+    }
 
-    return ORBIS_CAMERA_ERROR_NOT_CONNECTED;
+    device_info->deviceRevision = 1;
+    return ORBIS_OK;
 }
 
 } // namespace Libraries::Camera
