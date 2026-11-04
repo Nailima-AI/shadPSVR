@@ -235,6 +235,14 @@ if (ENABLE_DISCORD_RPC)
     add_subdirectory(discord-rpc)
 endif()
 
+# OpenXR loader
+if (ENABLE_OPENXR AND NOT TARGET OpenXR::openxr_loader)
+    set(BUILD_TESTS OFF)
+    set(BUILD_API_LAYERS OFF)
+    set(DYNAMIC_LOADER OFF)
+    add_subdirectory(openxr-sdk EXCLUDE_FROM_ALL)
+endif()
+
 # GCN Headers
 add_subdirectory(gcn)
 

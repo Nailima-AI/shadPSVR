@@ -8,6 +8,7 @@
 #include "core/libraries/hmd/hmd_error.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/libs.h"
+#include "core/xr/openxr_runtime.h"
 
 namespace Libraries::Hmd {
 
@@ -16,6 +17,17 @@ static s32 g_firmware_version = 0;
 static s32 g_internal_handle = 0;
 static Libraries::UserService::OrbisUserServiceUserId g_user_id = -1;
 
+static bool IsXrHeadsetActive() {
+    return Core::Xr::Runtime::Instance().IsHeadsetActive();
+}
+
+// PSVR panel values; titles size their eye buffers from these, the OpenXR runtime rescales.
+static void FillConnectedDeviceInformation(OrbisHmdDeviceInformation* info) {
+    info->status = OrbisHmdDeviceStatus::ORBIS_HMD_DEVICE_STATUS_READY;
+    info->device_info.panel_resolution = {1920, 1080};
+    info->hmu_mount = 1;
+}
+
 s32 PS4_SYSV_ABI sceHmdInitialize(const OrbisHmdInitializeParam* param) {
     if (g_library_initialized) {
         return ORBIS_HMD_ERROR_ALREADY_INITIALIZED;
@@ -23,7 +35,9 @@ s32 PS4_SYSV_ABI sceHmdInitialize(const OrbisHmdInitializeParam* param) {
     if (param == nullptr) {
         return ORBIS_HMD_ERROR_PARAMETER_NULL;
     }
-    LOG_WARNING(Lib_Hmd, "PSVR headsets are not supported yet");
+    if (!Core::Xr::Runtime::Instance().IsRequested()) {
+        LOG_WARNING(Lib_Hmd, "PSVR headsets are not supported yet");
+    }
     if (param->reserved0 != nullptr) {
         sceHmdDistortionInitialize(param->reserved0);
     }
@@ -38,7 +52,9 @@ s32 PS4_SYSV_ABI sceHmdInitialize315(const OrbisHmdInitializeParam* param) {
     if (param == nullptr) {
         return ORBIS_HMD_ERROR_PARAMETER_NULL;
     }
-    LOG_WARNING(Lib_Hmd, "PSVR headsets are not supported yet");
+    if (!Core::Xr::Runtime::Instance().IsRequested()) {
+        LOG_WARNING(Lib_Hmd, "PSVR headsets are not supported yet");
+    }
     g_library_initialized = true;
     return ORBIS_OK;
 }
@@ -76,13 +92,23 @@ s32 PS4_SYSV_ABI sceHmdGet2DEyeOffset(s32 handle, OrbisHmdEyeOffset* left_offset
     if (handle != g_internal_handle) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
-    if (g_firmware_version >= Common::ElfInfo::FW_450) {
+    if (g_firmware_version >= Common::ElfInfo::FW_450 && !IsXrHeadsetActive()) {
         // Due to some faulty in-library checks, a missing headset results in this error
         // instead of the expected ORBIS_HMD_ERROR_DEVICE_DISCONNECTED error.
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
     if (left_offset == nullptr || right_offset == nullptr) {
         return ORBIS_HMD_ERROR_PARAMETER_NULL;
+    }
+
+    if (const auto snapshot = Core::Xr::Runtime::Instance().GetTrackingSnapshot()) {
+        left_offset->offset_x = snapshot->eye_offsets[0].x;
+        left_offset->offset_y = snapshot->eye_offsets[0].y;
+        left_offset->offset_z = snapshot->eye_offsets[0].z;
+        right_offset->offset_x = snapshot->eye_offsets[1].x;
+        right_offset->offset_y = snapshot->eye_offsets[1].y;
+        right_offset->offset_z = snapshot->eye_offsets[1].z;
+        return ORBIS_OK;
     }
 
     // Return default values
@@ -119,6 +145,9 @@ s32 PS4_SYSV_ABI sceHmdGetDeviceInformation(OrbisHmdDeviceInformation* info) {
 
     memset(info, 0, sizeof(OrbisHmdDeviceInformation));
     info->status = OrbisHmdDeviceStatus::ORBIS_HMD_DEVICE_STATUS_NOT_DETECTED;
+    if (IsXrHeadsetActive()) {
+        FillConnectedDeviceInformation(info);
+    }
     info->user_id = g_user_id;
     return ORBIS_OK;
 }
@@ -128,7 +157,7 @@ s32 PS4_SYSV_ABI sceHmdGetDeviceInformationByHandle(s32 handle, OrbisHmdDeviceIn
     if (handle != g_internal_handle) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
-    if (g_firmware_version >= Common::ElfInfo::FW_450) {
+    if (g_firmware_version >= Common::ElfInfo::FW_450 && !IsXrHeadsetActive()) {
         // Due to some faulty in-library checks, a missing headset results in this error
         // instead of the expected ORBIS_HMD_ERROR_DEVICE_DISCONNECTED error.
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
@@ -142,6 +171,9 @@ s32 PS4_SYSV_ABI sceHmdGetDeviceInformationByHandle(s32 handle, OrbisHmdDeviceIn
 
     memset(info, 0, sizeof(OrbisHmdDeviceInformation));
     info->status = OrbisHmdDeviceStatus::ORBIS_HMD_DEVICE_STATUS_NOT_DETECTED;
+    if (IsXrHeadsetActive()) {
+        FillConnectedDeviceInformation(info);
+    }
     info->user_id = g_user_id;
     return ORBIS_OK;
 }
@@ -154,13 +186,21 @@ s32 PS4_SYSV_ABI sceHmdGetFieldOfView(s32 handle, OrbisHmdFieldOfView* field_of_
     if (handle != g_internal_handle) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
-    if (g_firmware_version >= Common::ElfInfo::FW_450) {
+    if (g_firmware_version >= Common::ElfInfo::FW_450 && !IsXrHeadsetActive()) {
         // Due to some faulty in-library checks, a missing headset results in this error
         // instead of the expected ORBIS_HMD_ERROR_DEVICE_DISCONNECTED error.
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
     if (!g_library_initialized) {
         return ORBIS_HMD_ERROR_NOT_INITIALIZED;
+    }
+
+    if (const auto snapshot = Core::Xr::Runtime::Instance().GetTrackingSnapshot()) {
+        field_of_view->tan_out = snapshot->fov.tan_out;
+        field_of_view->tan_in = snapshot->fov.tan_in;
+        field_of_view->tan_top = snapshot->fov.tan_top;
+        field_of_view->tan_bottom = snapshot->fov.tan_bottom;
+        return ORBIS_OK;
     }
 
     // These values are a hardcoded return when a headset is connected.
@@ -182,7 +222,7 @@ s32 PS4_SYSV_ABI sceHmdGetInertialSensorData(s32 handle, void* data, s32 unk) {
     if (handle != g_internal_handle) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
-    if (g_firmware_version >= Common::ElfInfo::FW_450) {
+    if (g_firmware_version >= Common::ElfInfo::FW_450 && !IsXrHeadsetActive()) {
         // Due to some faulty in-library checks, a missing headset results in this error
         // instead of the expected ORBIS_HMD_ERROR_DEVICE_DISCONNECTED error.
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
@@ -799,7 +839,7 @@ s32 PS4_SYSV_ABI Func_69383B2B4E3AEABF(s32 handle, void* data, s32 unk) {
     if (handle != g_internal_handle) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
-    if (g_firmware_version >= Common::ElfInfo::FW_450) {
+    if (g_firmware_version >= Common::ElfInfo::FW_450 && !IsXrHeadsetActive()) {
         // Due to some faulty in-library checks, a missing headset results in this error
         // instead of the expected ORBIS_HMD_ERROR_DEVICE_DISCONNECTED error.
         return ORBIS_HMD_ERROR_HANDLE_INVALID;

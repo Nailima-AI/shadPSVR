@@ -20,6 +20,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
+#include "core/xr/openxr_runtime.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -202,6 +203,17 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
 
     if (enable_debug_utils) {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+
+    if (window_type != Frontend::WindowSystemType::Headless &&
+        Core::Xr::Runtime::Instance().CreateXrInstance()) {
+        for (const char* extension : Core::Xr::Runtime::Instance().GetVulkanInstanceExtensions()) {
+            if (std::ranges::none_of(extensions, [&](const char* existing) {
+                    return std::strcmp(existing, extension) == 0;
+                })) {
+                extensions.push_back(extension);
+            }
+        }
     }
 
     // Sanitize extension list

@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
+#include "core/xr/openxr_runtime.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
@@ -162,6 +163,18 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
         physical_device = physical_devices[physical_device_index];
     }
 
+    if (const auto xr_device = Core::Xr::Runtime::Instance().GetVulkanPhysicalDevice(*instance)) {
+        const auto it = std::ranges::find_if(physical_devices, [&](const vk::PhysicalDevice& dev) {
+            return static_cast<VkPhysicalDevice>(dev) == *xr_device;
+        });
+        if (it != physical_devices.end()) {
+            physical_device = *it;
+            LOG_INFO(Render_Vulkan, "Using the physical device required by the OpenXR runtime");
+        } else {
+            LOG_ERROR(Render_Vulkan, "OpenXR runtime requested an unknown physical device");
+        }
+    }
+
     available_extensions = GetSupportedExtensions(physical_device);
     format_properties = GetFormatProperties(physical_device);
     properties = physical_device.getProperties();
@@ -182,12 +195,15 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));
 
     CreateDevice();
+    Core::Xr::Runtime::Instance().CreateSession(*instance, physical_device, *device,
+                                                queue_family_index, 0);
     CollectPhysicalMemoryInfo();
     CollectImageFormatInfo();
     CollectToolingInfo();
 }
 
 Instance::~Instance() {
+    Core::Xr::Runtime::Instance().Shutdown();
     ImGui::Core::Shutdown(GetDevice());
     vmaDestroyAllocator(allocator);
 }
@@ -238,7 +254,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 48> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -366,6 +382,15 @@ bool Instance::CreateDevice() {
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+    for (const char* extension : Core::Xr::Runtime::Instance().GetVulkanDeviceExtensions()) {
+        const bool already_enabled =
+            std::ranges::any_of(enabled_extensions, [&](const char* enabled) {
+                return std::string_view{enabled} == extension;
+            });
+        if (!already_enabled) {
+            add_extension(extension);
+        }
+    }
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
