@@ -195,15 +195,17 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));
 
     CreateDevice();
-    Core::Xr::Runtime::Instance().CreateSession(*instance, physical_device, *device,
-                                                queue_family_index, 0);
+    owns_xr_session = Core::Xr::Runtime::Instance().CreateSession(*instance, physical_device,
+                                                                  *device, queue_family_index, 0);
     CollectPhysicalMemoryInfo();
     CollectImageFormatInfo();
     CollectToolingInfo();
 }
 
 Instance::~Instance() {
-    Core::Xr::Runtime::Instance().Shutdown();
+    if (owns_xr_session) {
+        Core::Xr::Runtime::Instance().Shutdown();
+    }
     ImGui::Core::Shutdown(GetDevice());
     vmaDestroyAllocator(allocator);
 }

@@ -20,7 +20,6 @@ static bool g_library_initialized = false;
 static constexpr s32 MaxControllers = 2;
 static constexpr float SphereRadius = 0.0225f;
 static std::array<s32, MaxControllers> g_handles{-1, -1};
-static std::array<s32, MaxControllers> g_sample_counts{};
 
 static constexpr std::array<std::pair<u32, u16>, 7> ButtonMap{{
     {Core::Xr::CONTROLLER_BUTTON_CROSS, ORBIS_MOVE_BUTTON_CROSS},
@@ -56,8 +55,8 @@ static const Core::Xr::ControllerSnapshot* FindController(
     return &snapshot->hands[hand];
 }
 
-static void FillMoveData(const Core::Xr::ControllerSnapshot& controller, u64 timestamp, s32 hand,
-                         OrbisMoveData* data) {
+static void FillMoveData(const Core::Xr::ControllerSnapshot& controller,
+                         const Core::Xr::TrackingSnapshot& snapshot, OrbisMoveData* data) {
     std::memset(data, 0, sizeof(OrbisMoveData));
     PxmMoveState state{};
     pxm_move_from_grip(&controller.grip,
@@ -80,8 +79,8 @@ static void FillMoveData(const Core::Xr::ControllerSnapshot& controller, u64 tim
     }
     data->button_data.button_data = buttons;
     data->button_data.trigger_data = trigger;
-    data->timestamp = static_cast<s64>(timestamp);
-    data->count = ++g_sample_counts[hand];
+    data->timestamp = static_cast<s64>(snapshot.timestamp_us);
+    data->count = static_cast<s32>(snapshot.sequence);
     data->temperature = 25.0f;
 }
 
@@ -143,7 +142,7 @@ s32 PS4_SYSV_ABI sceMoveReadStateLatest(s32 handle, OrbisMoveData* data) {
     if (!controller) {
         return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
     }
-    FillMoveData(*controller, snapshot->timestamp_us, GetMoveHandIndex(handle), data);
+    FillMoveData(*controller, *snapshot, data);
     return ORBIS_OK;
 }
 
@@ -167,7 +166,7 @@ s32 PS4_SYSV_ABI sceMoveReadStateRecent(s32 handle, s64 timestamp, OrbisMoveData
         *out_count = 0;
         return ORBIS_OK;
     }
-    FillMoveData(*controller, snapshot->timestamp_us, GetMoveHandIndex(handle), data);
+    FillMoveData(*controller, *snapshot, data);
     *out_count = 1;
     return ORBIS_OK;
 }

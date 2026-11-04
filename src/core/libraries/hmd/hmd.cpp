@@ -203,13 +203,14 @@ s32 PS4_SYSV_ABI sceHmdGetFieldOfView(s32 handle, OrbisHmdFieldOfView* field_of_
         field_of_view->tan_bottom = snapshot->fov.tan_bottom;
         return ORBIS_OK;
     }
-
     // These values are a hardcoded return when a headset is connected.
-    // Leaving this here for future developers.
-    // field_of_view->tan_out = 1.20743;
-    // field_of_view->tan_in = 1.181346;
-    // field_of_view->tan_top = 1.262872;
-    // field_of_view->tan_bottom = 1.262872;
+    if (IsXrHeadsetActive()) {
+        field_of_view->tan_out = 1.20743f;
+        field_of_view->tan_in = 1.181346f;
+        field_of_view->tan_top = 1.262872f;
+        field_of_view->tan_bottom = 1.262872f;
+        return ORBIS_OK;
+    }
 
     // Fails internally due to some internal library checks that break without a connected headset.
     return ORBIS_HMD_ERROR_HANDLE_INVALID;

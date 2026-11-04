@@ -19,6 +19,10 @@ void Presenter::SubmitXrEyes(const std::array<AmdGpu::Image, 2>& eyes,
         xr_pp_created = true;
     }
 
+    if (!xr.EyeSwapchainsMatch(submission.width, submission.height)) {
+        draw_scheduler.Finish();
+        xr_views = {};
+    }
     if (xr.EnsureEyeSwapchains(submission.width, submission.height)) {
         for (u32 eye = 0; eye < 2; ++eye) {
             xr_views[eye].clear();

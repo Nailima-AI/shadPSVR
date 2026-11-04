@@ -66,6 +66,10 @@ s64 Runtime::GetSwapchainFormat() const {
     return 0;
 }
 
+bool Runtime::EyeSwapchainsMatch(const u32*, const u32*) const {
+    return false;
+}
+
 bool Runtime::EnsureEyeSwapchains(const u32*, const u32*) {
     return false;
 }

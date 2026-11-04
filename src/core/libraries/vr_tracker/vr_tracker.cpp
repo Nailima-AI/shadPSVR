@@ -106,7 +106,11 @@ static bool FillPadResult(const Core::Xr::TrackingSnapshot& snapshot,
 static void FillHmdResult(const Core::Xr::TrackingSnapshot& snapshot,
                           OrbisVrTrackerResultData* result) {
     FillTrackedCommon(snapshot.timestamp_us, result);
-    if (snapshot.has_velocity) {
+    if (!snapshot.head_valid) {
+        result->status = ORBIS_VR_TRACKER_STATUS_NOT_TRACKING;
+        result->position_quality = ORBIS_VR_TRACKER_QUALITY_NOT_VISIBLE;
+        result->orientation_quality = ORBIS_VR_TRACKER_QUALITY_NOT_VISIBLE;
+    } else if (snapshot.has_velocity) {
         FillVelocity(snapshot.linear_velocity, snapshot.angular_velocity, result);
     }
     FillPose(result->hmd_info.device_pose, snapshot.head);

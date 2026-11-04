@@ -52,6 +52,7 @@ static std::vector<u8> yuy2_scaled(c_yuy2_frame_size / 4);
 static u32 g_format_levels[ORBIS_CAMERA_MAX_DEVICE_NUM]{1, 1};
 static u64 g_frame_counter = 0;
 static u64 g_frame_timestamp = 0;
+static constexpr u64 c_virtual_frame_interval_us = 1'000'000 / 60;
 
 SDL_Camera* sdl_camera = nullptr;
 OrbisCameraConfigExtention output_config0, output_config1;
@@ -192,9 +193,13 @@ s32 PS4_SYSV_ABI sceCameraGetFrameData(s32 handle, OrbisCameraFrameData* frame_d
         return ORBIS_CAMERA_ERROR_NOT_CONNECTED;
     }
 
-    if (backend == CameraBackend::Virtual || AcquireHostFrame()) {
+    const u64 now = Libraries::Kernel::sceKernelGetProcessTime();
+    const bool virtual_frame_due =
+        backend == CameraBackend::Virtual &&
+        (g_frame_counter == 0 || now - g_frame_timestamp >= c_virtual_frame_interval_us);
+    if (virtual_frame_due || (backend == CameraBackend::Host && AcquireHostFrame())) {
         ++g_frame_counter;
-        g_frame_timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+        g_frame_timestamp = now;
     } else if (g_frame_counter == 0) {
         return ORBIS_CAMERA_ERROR_BUSY;
     }

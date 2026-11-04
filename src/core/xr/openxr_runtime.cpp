@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -98,6 +99,7 @@ struct Runtime::Impl {
         u32 width{};
         u32 height{};
         std::vector<VkImage> images;
+        std::optional<u32> unwaited_index;
     };
     s64 swapchain_format{};
     mutable std::mutex layer_mutex;
@@ -506,19 +508,16 @@ struct Runtime::Impl {
         };
     }
 
-    void SampleTracking(XrTime display_time) {
-        XrSpaceVelocity velocity{.type = XR_TYPE_SPACE_VELOCITY};
-        XrSpaceLocation head_location{.type = XR_TYPE_SPACE_LOCATION, .next = &velocity};
-        if (!Check(xrLocateSpace(view_space, local_space, display_time, &head_location),
-                   "xrLocateSpace")) {
-            return;
-        }
-        constexpr XrSpaceLocationFlags pose_valid =
-            XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
-        if ((head_location.locationFlags & pose_valid) != pose_valid) {
-            return;
-        }
+    static constexpr XrSpaceLocationFlags PoseValid =
+        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+    static constexpr XrSpaceVelocityFlags VelocityValid =
+        XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
 
+    bool LocateHead(XrTime display_time, XrSpaceLocation& head, XrView (&views)[2]) {
+        if (!Check(xrLocateSpace(view_space, local_space, display_time, &head), "xrLocateSpace") ||
+            (head.locationFlags & PoseValid) != PoseValid) {
+            return false;
+        }
         const XrViewLocateInfo locate_info{
             .type = XR_TYPE_VIEW_LOCATE_INFO,
             .viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
@@ -526,22 +525,21 @@ struct Runtime::Impl {
             .space = local_space,
         };
         XrViewState view_state{.type = XR_TYPE_VIEW_STATE};
-        XrView views[2]{{.type = XR_TYPE_VIEW}, {.type = XR_TYPE_VIEW}};
         u32 view_count = 0;
-        if (!Check(xrLocateViews(session, &locate_info, &view_state, 2, &view_count, views),
-                   "xrLocateViews") ||
-            view_count != 2) {
-            return;
-        }
+        return Check(xrLocateViews(session, &locate_info, &view_state, 2, &view_count, views),
+                     "xrLocateViews") &&
+               view_count == 2 && (view_state.viewStateFlags & PoseValid) == PoseValid;
+    }
 
-        const PxmPose xr_head = ToPxm(head_location.pose);
-        const PxmFov left_fov = ToPxm(views[0].fov);
-        const PxmFov right_fov = ToPxm(views[1].fov);
-        const PxmPose xr_eyes[2] = {ToPxm(views[0].pose), ToPxm(views[1].pose)};
+    void SampleTracking(XrTime display_time) {
+        XrSpaceVelocity head_velocity{.type = XR_TYPE_SPACE_VELOCITY};
+        XrSpaceLocation head_location{.type = XR_TYPE_SPACE_LOCATION, .next = &head_velocity};
+        XrView views[2]{{.type = XR_TYPE_VIEW}, {.type = XR_TYPE_VIEW}};
+        const bool head_valid = LocateHead(display_time, head_location, views);
 
-        TrackingSnapshot next{};
         XrSpaceLocation hand_locations[2]{};
         XrSpaceVelocity hand_velocities[2]{};
+        TrackingSnapshot next{};
         if (SyncInput()) {
             for (int hand = 0; hand < 2; ++hand) {
                 ReadController(hand, display_time, next.hands[hand], hand_locations[hand],
@@ -549,41 +547,57 @@ struct Runtime::Impl {
             }
             ApplyVibration();
         }
-        for (int eye = 0; eye < 2; ++eye) {
-            pxm_eye_offset(&xr_head, &xr_eyes[eye], &next.eye_offsets[eye]);
+
+        const PxmPose xr_head = ToPxm(head_location.pose);
+        const PxmPose xr_eyes[2] = {ToPxm(views[0].pose), ToPxm(views[1].pose)};
+        if (head_valid) {
+            const PxmFov left_fov = ToPxm(views[0].fov);
+            const PxmFov right_fov = ToPxm(views[1].fov);
+            for (int eye = 0; eye < 2; ++eye) {
+                pxm_eye_offset(&xr_head, &xr_eyes[eye], &next.eye_offsets[eye]);
+            }
+            pxm_fov_to_orbis(&left_fov, &right_fov, &next.fov);
         }
-        pxm_fov_to_orbis(&left_fov, &right_fov, &next.fov);
+        next.head_valid = head_valid;
         next.timestamp_us = Libraries::Kernel::sceKernelGetProcessTime();
 
         std::scoped_lock lock{state_mutex};
-        if (recenter_requested.exchange(false)) {
-            pxm_tracking_space_recenter(&tracking_space, &xr_head);
-        }
-        pxm_xr_pose_to_orbis(&tracking_space, &xr_head, &next.head);
-        for (int eye = 0; eye < 2; ++eye) {
-            pxm_xr_pose_to_orbis(&tracking_space, &xr_eyes[eye], &next.eyes[eye]);
-        }
-        constexpr XrSpaceVelocityFlags velocity_valid =
-            XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
-        next.has_velocity = (velocity.velocityFlags & velocity_valid) == velocity_valid;
-        if (next.has_velocity) {
-            pxm_xr_vector_to_orbis(&tracking_space, ToPxm(velocity.linearVelocity),
-                                   &next.linear_velocity);
-            pxm_xr_vector_to_orbis(&tracking_space, ToPxm(velocity.angularVelocity),
-                                   &next.angular_velocity);
+        next.sequence = snapshot ? snapshot->sequence + 1 : 1;
+        if (head_valid) {
+            if (recenter_requested.exchange(false)) {
+                pxm_tracking_space_recenter(&tracking_space, &xr_head);
+            }
+            pxm_xr_pose_to_orbis(&tracking_space, &xr_head, &next.head);
+            for (int eye = 0; eye < 2; ++eye) {
+                pxm_xr_pose_to_orbis(&tracking_space, &xr_eyes[eye], &next.eyes[eye]);
+            }
+            next.has_velocity = (head_velocity.velocityFlags & VelocityValid) == VelocityValid;
+            if (next.has_velocity) {
+                pxm_xr_vector_to_orbis(&tracking_space, ToPxm(head_velocity.linearVelocity),
+                                       &next.linear_velocity);
+                pxm_xr_vector_to_orbis(&tracking_space, ToPxm(head_velocity.angularVelocity),
+                                       &next.angular_velocity);
+            }
+        } else if (snapshot) {
+            next.head = snapshot->head;
+            std::memcpy(next.eyes, snapshot->eyes, sizeof(next.eyes));
+            std::memcpy(next.eye_offsets, snapshot->eye_offsets, sizeof(next.eye_offsets));
+            next.fov = snapshot->fov;
+        } else {
+            return;
         }
         for (int hand = 0; hand < 2; ++hand) {
             auto& controller = next.hands[hand];
             const auto& location = hand_locations[hand];
             const auto& hand_velocity = hand_velocities[hand];
-            controller.pose_valid = (location.locationFlags & pose_valid) == pose_valid;
+            controller.pose_valid = (location.locationFlags & PoseValid) == PoseValid;
             if (!controller.pose_valid) {
                 continue;
             }
             const PxmPose grip = ToPxm(location.pose);
             pxm_xr_pose_to_orbis(&tracking_space, &grip, &controller.grip);
             controller.has_velocity =
-                (hand_velocity.velocityFlags & velocity_valid) == velocity_valid;
+                (hand_velocity.velocityFlags & VelocityValid) == VelocityValid;
             if (controller.has_velocity) {
                 pxm_xr_vector_to_orbis(&tracking_space, ToPxm(hand_velocity.linearVelocity),
                                        &controller.linear_velocity);
@@ -608,6 +622,7 @@ struct Runtime::Impl {
 
             XrFrameState frame_state{.type = XR_TYPE_FRAME_STATE};
             if (!Check(xrWaitFrame(session, nullptr, &frame_state), "xrWaitFrame")) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
             {
@@ -866,21 +881,23 @@ s64 Runtime::GetSwapchainFormat() const {
     return impl->session != XR_NULL_HANDLE ? impl->swapchain_format : 0;
 }
 
-bool Runtime::EnsureEyeSwapchains(const u32 width[2], const u32 height[2]) {
-    if (impl->session == XR_NULL_HANDLE || impl->swapchain_format == 0) {
-        return false;
-    }
-    {
-        std::scoped_lock lock{impl->layer_mutex};
-        bool matches = true;
-        for (u32 eye = 0; eye < 2; ++eye) {
-            const auto& swapchain = impl->eye_swapchains[eye];
-            matches &= swapchain.handle != XR_NULL_HANDLE && swapchain.width == width[eye] &&
-                       swapchain.height == height[eye];
-        }
-        if (matches) {
+bool Runtime::EyeSwapchainsMatch(const u32 width[2], const u32 height[2]) const {
+    std::scoped_lock lock{impl->layer_mutex};
+    for (u32 eye = 0; eye < 2; ++eye) {
+        const auto& swapchain = impl->eye_swapchains[eye];
+        if (swapchain.handle == XR_NULL_HANDLE || swapchain.width != width[eye] ||
+            swapchain.height != height[eye]) {
             return false;
         }
+    }
+    return true;
+}
+
+// The caller must make sure the GPU no longer uses the previous swapchain images.
+bool Runtime::EnsureEyeSwapchains(const u32 width[2], const u32 height[2]) {
+    if (impl->session == XR_NULL_HANDLE || impl->swapchain_format == 0 ||
+        EyeSwapchainsMatch(width, height)) {
+        return false;
     }
     impl->DestroySwapchains();
 
@@ -900,7 +917,12 @@ bool Runtime::EnsureEyeSwapchains(const u32 width[2], const u32 height[2]) {
         };
         if (!impl->Check(xrCreateSwapchain(impl->session, &info, &swapchain.handle),
                          "xrCreateSwapchain")) {
-            swapchain = {};
+            for (auto& created : impl->eye_swapchains) {
+                if (created.handle != XR_NULL_HANDLE) {
+                    xrDestroySwapchain(created.handle);
+                }
+                created = {};
+            }
             return false;
         }
         u32 count = 0;
@@ -929,27 +951,39 @@ std::vector<VkImage_T*> Runtime::GetEyeSwapchainImages(u32 eye) const {
 
 std::optional<u32> Runtime::AcquireEyeImage(u32 eye) {
     XrSwapchain swapchain;
+    std::optional<u32> index;
     {
         std::scoped_lock lock{impl->layer_mutex};
-        swapchain = impl->eye_swapchains[eye].handle;
+        auto& eye_swapchain = impl->eye_swapchains[eye];
+        swapchain = eye_swapchain.handle;
+        index = std::exchange(eye_swapchain.unwaited_index, std::nullopt);
     }
     if (swapchain == XR_NULL_HANDLE) {
         return std::nullopt;
     }
-    u32 index = 0;
-    {
+    if (!index) {
+        u32 acquired = 0;
         std::scoped_lock lock{Vulkan::Scheduler::submit_mutex};
-        if (!impl->Check(xrAcquireSwapchainImage(swapchain, nullptr, &index),
+        if (!impl->Check(xrAcquireSwapchainImage(swapchain, nullptr, &acquired),
                          "xrAcquireSwapchainImage")) {
             return std::nullopt;
         }
+        index = acquired;
     }
+    // An image that timed out stays acquired and has to be waited on again before release.
     const XrSwapchainImageWaitInfo wait_info{
         .type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,
-        .timeout = 1'000'000'000,
+        .timeout = 100'000'000,
     };
-    if (xrWaitSwapchainImage(swapchain, &wait_info) != XR_SUCCESS) {
-        LOG_ERROR(Lib_Hmd, "OpenXR swapchain image wait timed out");
+    const XrResult result = xrWaitSwapchainImage(swapchain, &wait_info);
+    if (result == XR_TIMEOUT_EXPIRED) {
+        std::scoped_lock lock{impl->layer_mutex};
+        if (impl->eye_swapchains[eye].handle == swapchain) {
+            impl->eye_swapchains[eye].unwaited_index = index;
+        }
+        return std::nullopt;
+    }
+    if (!impl->Check(result, "xrWaitSwapchainImage")) {
         return std::nullopt;
     }
     return index;
@@ -964,18 +998,29 @@ void Runtime::ReleaseEyeImage(u32 eye) {
 }
 
 void Runtime::PublishEyes(const EyeSubmission& submission) {
+    const auto valid_fov = [](const PxmFov& fov) {
+        return fov.angle_left < fov.angle_right && fov.angle_down < fov.angle_up;
+    };
+    if (!valid_fov(submission.fov[0]) || !valid_fov(submission.fov[1])) {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            LOG_ERROR(Lib_Hmd, "Ignoring an eye submission with an empty field of view");
+        }
+        return;
+    }
     PxmPose head_xr{};
+    PxmVec3 eye_offsets[2]{};
     {
         std::scoped_lock lock{impl->state_mutex};
         pxm_orbis_pose_to_xr(&impl->tracking_space, &submission.head, &head_xr);
+        if (impl->snapshot) {
+            std::memcpy(eye_offsets, impl->snapshot->eye_offsets, sizeof(eye_offsets));
+        }
     }
-    const auto snapshot = GetTrackingSnapshot();
     std::scoped_lock lock{impl->layer_mutex};
     for (u32 eye = 0; eye < 2; ++eye) {
-        PxmPose eye_pose = head_xr;
-        if (snapshot) {
-            pxm_pose_apply_local_offset(&head_xr, snapshot->eye_offsets[eye], &eye_pose);
-        }
+        PxmPose eye_pose{};
+        pxm_pose_apply_local_offset(&head_xr, eye_offsets[eye], &eye_pose);
         auto& view = impl->layer_views[eye];
         view = {.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
         std::memcpy(&view.pose, &eye_pose, sizeof(view.pose));

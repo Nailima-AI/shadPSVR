@@ -42,6 +42,8 @@ struct ControllerSnapshot {
 
 // All poses are already in the Orbis tracking space.
 struct TrackingSnapshot {
+    bool head_valid;
+    u64 sequence;
     PxmPose head;
     PxmPose eyes[2];
     PxmVec3 eye_offsets[2];
@@ -90,6 +92,7 @@ public:
 
     // Eye swapchains. All of these are called from the GPU thread.
     s64 GetSwapchainFormat() const;
+    bool EyeSwapchainsMatch(const u32 width[2], const u32 height[2]) const;
     bool EnsureEyeSwapchains(const u32 width[2], const u32 height[2]);
     std::vector<VkImage_T*> GetEyeSwapchainImages(u32 eye) const;
     std::optional<u32> AcquireEyeImage(u32 eye);
