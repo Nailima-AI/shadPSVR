@@ -14,6 +14,7 @@
 #include "core/memory.h"
 
 #include <array>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -53,6 +54,16 @@ static u32 g_format_levels[ORBIS_CAMERA_MAX_DEVICE_NUM]{1, 1};
 static u64 g_frame_counter = 0;
 static u64 g_frame_timestamp = 0;
 static constexpr u64 c_virtual_frame_interval_us = 1'000'000 / 60;
+
+struct OutputLayout {
+    OrbisCameraFormat formats[ORBIS_CAMERA_MAX_DEVICE_NUM];
+    u32 levels[ORBIS_CAMERA_MAX_DEVICE_NUM];
+
+    bool operator==(const OutputLayout& other) const {
+        return std::memcmp(this, &other, sizeof(OutputLayout)) == 0;
+    }
+};
+static std::optional<OutputLayout> g_converted_layout;
 
 SDL_Camera* sdl_camera = nullptr;
 OrbisCameraConfigExtention output_config0, output_config1;
@@ -136,23 +147,31 @@ static bool AcquireHostFrame() {
     return converted != nullptr;
 }
 
-static void WriteBaseLevel(const std::vector<u8>& yuy2_frame, OrbisCameraBaseFormat format,
-                           u16* raw16, u8* raw8, void*& out) {
+static void* BaseLevelBuffer(OrbisCameraBaseFormat format, u16* raw16, u8* raw8) {
     switch (format) {
     case ORBIS_CAMERA_FORMAT_YUV422:
-        std::memcpy(raw16, yuy2_frame.data(), c_width * c_height * sizeof(u16));
-        out = raw16;
+    case ORBIS_CAMERA_FORMAT_RAW16:
+        return raw16;
+    case ORBIS_CAMERA_FORMAT_RAW8:
+        return raw8;
+    default:
+        return nullptr;
+    }
+}
+
+static void WriteBaseLevel(const std::vector<u8>& yuy2_frame, OrbisCameraBaseFormat format,
+                           void* out) {
+    switch (format) {
+    case ORBIS_CAMERA_FORMAT_YUV422:
+        std::memcpy(out, yuy2_frame.data(), c_yuy2_frame_size);
         break;
     case ORBIS_CAMERA_FORMAT_RAW16:
-        ConvertYUY2ToRAW16(yuy2_frame.data(), raw16, c_width, c_height);
-        out = raw16;
+        ConvertYUY2ToRAW16(yuy2_frame.data(), static_cast<u16*>(out), c_width, c_height);
         break;
     case ORBIS_CAMERA_FORMAT_RAW8:
-        ConvertYUY2ToRAW8(yuy2_frame.data(), raw8, c_width, c_height);
-        out = raw8;
+        ConvertYUY2ToRAW8(yuy2_frame.data(), static_cast<u8*>(out), c_width, c_height);
         break;
     default:
-        out = nullptr;
         break;
     }
 }
@@ -197,21 +216,31 @@ s32 PS4_SYSV_ABI sceCameraGetFrameData(s32 handle, OrbisCameraFrameData* frame_d
     const bool virtual_frame_due =
         backend == CameraBackend::Virtual &&
         (g_frame_counter == 0 || now - g_frame_timestamp >= c_virtual_frame_interval_us);
-    if (virtual_frame_due || (backend == CameraBackend::Host && AcquireHostFrame())) {
+    const bool new_frame =
+        virtual_frame_due || (backend == CameraBackend::Host && AcquireHostFrame());
+    if (new_frame) {
         ++g_frame_counter;
         g_frame_timestamp = now;
-    } else if (g_frame_counter == 0) {
-        return ORBIS_CAMERA_ERROR_BUSY;
     }
 
     const OrbisCameraConfigExtention* configs[ORBIS_CAMERA_MAX_DEVICE_NUM] = {&output_config0,
                                                                               &output_config1};
+    const OutputLayout layout{
+        .formats = {output_config0.format, output_config1.format},
+        .levels = {g_format_levels[0], g_format_levels[1]},
+    };
+    const bool convert = new_frame || !g_converted_layout || *g_converted_layout != layout;
+    g_converted_layout = layout;
     u16* raw16_buffers[ORBIS_CAMERA_MAX_DEVICE_NUM] = {raw16_buffer1, raw16_buffer2};
     u8* raw8_buffers[ORBIS_CAMERA_MAX_DEVICE_NUM] = {raw8_buffer1, raw8_buffer2};
     for (s32 device = 0; device < ORBIS_CAMERA_MAX_DEVICE_NUM; ++device) {
         const auto& format = configs[device]->format;
-        WriteBaseLevel(yuy2_frames[device], format.formatLevel0, raw16_buffers[device],
-                       raw8_buffers[device], frame_data->pFramePointerList[device][0]);
+        void* base =
+            BaseLevelBuffer(format.formatLevel0, raw16_buffers[device], raw8_buffers[device]);
+        if (convert && base) {
+            WriteBaseLevel(yuy2_frames[device], format.formatLevel0, base);
+        }
+        frame_data->pFramePointerList[device][0] = base;
         frame_data->framePosition[device][0] = {0, 0, c_width, c_height};
         frame_data->frameSize[device][0] =
             c_width * c_height * SizeOfBaseFormat(format.formatLevel0);
@@ -228,8 +257,10 @@ s32 PS4_SYSV_ABI sceCameraGetFrameData(s32 handle, OrbisCameraFrameData* frame_d
                 frame_data->frameSize[device][level + 1] = 0;
                 continue;
             }
-            WriteScaledLevel(yuy2_frames[device], scaled, width, height,
-                             scaled_buffers[device][level]);
+            if (convert) {
+                WriteScaledLevel(yuy2_frames[device], scaled, width, height,
+                                 scaled_buffers[device][level]);
+            }
             frame_data->pFramePointerList[device][level + 1] = scaled_buffers[device][level];
             frame_data->framePosition[device][level + 1] = {0, 0, width, height};
             frame_data->frameSize[device][level + 1] = width * height * SizeOfScaleFormat(scaled);
@@ -238,7 +269,7 @@ s32 PS4_SYSV_ABI sceCameraGetFrameData(s32 handle, OrbisCameraFrameData* frame_d
         frame_data->meta.frame[device] = g_frame_counter;
         frame_data->meta.timestamp[device] = g_frame_timestamp;
         frame_data->meta.deviceTimestamp[device] = static_cast<u32>(g_frame_timestamp);
-        frame_data->status[device] = 1;
+        frame_data->status[device] = new_frame ? 1 : -1;
     }
 
     // on older firmwares, this wasn't present, and the original library also checks struct size
@@ -338,6 +369,7 @@ s32 PS4_SYSV_ABI sceCameraOpen(Libraries::UserService::OrbisUserServiceUserId us
         buffers_initialized = true;
     }
     g_frame_counter = 0;
+    g_converted_layout.reset();
 
     g_library_opened = true;
     return ++g_handles;
@@ -378,9 +410,14 @@ s32 PS4_SYSV_ABI sceCameraStart(s32 handle, OrbisCameraStartParameter* param) {
     g_format_levels[0] = param->formatLevel[0];
     g_format_levels[1] = param->formatLevel[1];
 
-    if (GetCameraBackend() == CameraBackend::Virtual) {
+    switch (GetCameraBackend()) {
+    case CameraBackend::Disconnected:
+        return ORBIS_CAMERA_ERROR_NOT_CONNECTED;
+    case CameraBackend::Virtual:
         LOG_INFO(Lib_Camera, "No host camera selected, using a virtual PlayStation Camera");
         return ORBIS_OK;
+    case CameraBackend::Host:
+        break;
     }
 
     SDL_CameraID* devices = NULL;

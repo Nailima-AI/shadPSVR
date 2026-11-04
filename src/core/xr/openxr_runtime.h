@@ -85,6 +85,7 @@ public:
     bool IsHeadsetActive() const;
     std::optional<TrackingSnapshot> GetTrackingSnapshot() const;
     void Recenter();
+    void RecenterOrientation();
     void SetVibration(Hand hand, float amplitude);
 
     // Called once per headset frame from the frame loop, right after xrWaitFrame.
@@ -96,8 +97,8 @@ public:
     bool EnsureEyeSwapchains(const u32 width[2], const u32 height[2]);
     std::vector<VkImage_T*> GetEyeSwapchainImages(u32 eye) const;
     std::optional<u32> AcquireEyeImage(u32 eye);
-    void ReleaseEyeImage(u32 eye);
-    void PublishEyes(const EyeSubmission& submission);
+    // Releases both eye images and shows them with the submission's pose and field of view.
+    void PresentEyes(const EyeSubmission& submission);
 
     ~Runtime();
 

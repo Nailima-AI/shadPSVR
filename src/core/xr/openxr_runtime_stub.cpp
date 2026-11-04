@@ -58,6 +58,8 @@ std::optional<TrackingSnapshot> Runtime::GetTrackingSnapshot() const {
 
 void Runtime::Recenter() {}
 
+void Runtime::RecenterOrientation() {}
+
 void Runtime::SetVibration(Hand, float) {}
 
 void Runtime::SetFrameCallback(std::function<void()>) {}
@@ -82,8 +84,6 @@ std::optional<u32> Runtime::AcquireEyeImage(u32) {
     return std::nullopt;
 }
 
-void Runtime::ReleaseEyeImage(u32) {}
-
-void Runtime::PublishEyes(const EyeSubmission&) {}
+void Runtime::PresentEyes(const EyeSubmission&) {}
 
 } // namespace Core::Xr

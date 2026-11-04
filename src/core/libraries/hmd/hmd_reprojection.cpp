@@ -29,13 +29,18 @@ static bool g_reprojection_initialized = false;
 static std::mutex g_event_mutex;
 static std::array<std::pair<s64, s32>, 2> g_user_events{{{-1, -1}, {-1, -1}}};
 
-static void TriggerCompositorEvents() {
+enum UserEvent : u32 { UserEventStart, UserEventEnd };
+
+static void TriggerUserEvent(UserEvent event) {
     std::scoped_lock lock{g_event_mutex};
-    for (const auto [equeue, id] : g_user_events) {
-        if (equeue != -1) {
-            Libraries::Kernel::sceKernelTriggerUserEvent(equeue, id, nullptr);
-        }
+    const auto [equeue, id] = g_user_events[event];
+    if (equeue != -1) {
+        Libraries::Kernel::sceKernelTriggerUserEvent(equeue, id, nullptr);
     }
+}
+
+static void TriggerCompositorStart() {
+    TriggerUserEvent(UserEventStart);
 }
 
 static AmdGpu::Image ReadTextureSharp(const void* sharp) {
@@ -65,7 +70,11 @@ static s32 SubmitStereo(const OrbisHmdReprojectionFrameParam* param,
         submission.width[eye] = static_cast<u32>(eyes[eye].width) + 1;
         submission.height[eye] = static_cast<u32>(eyes[eye].height) + 1;
     }
-    liverpool->SendCommand([eyes, submission]() { presenter->SubmitXrEyes(eyes, submission); });
+    // The eye textures are only complete once the command buffers already submitted have run.
+    liverpool->SendCommandWhenIdle([eyes, submission]() {
+        presenter->SubmitXrEyes(eyes, submission);
+        TriggerUserEvent(UserEventEnd);
+    });
     return ORBIS_OK;
 }
 
@@ -82,14 +91,14 @@ s32 PS4_SYSV_ABI sceHmdReprojectionAddDisplayBuffer(s32 index, void* reserved) {
 s32 PS4_SYSV_ABI sceHmdReprojectionClearUserEventEnd() {
     LOG_INFO(Lib_Hmd, "called");
     std::scoped_lock lock{g_event_mutex};
-    g_user_events[1] = {-1, -1};
+    g_user_events[UserEventEnd] = {-1, -1};
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceHmdReprojectionClearUserEventStart() {
     LOG_INFO(Lib_Hmd, "called");
     std::scoped_lock lock{g_event_mutex};
-    g_user_events[0] = {-1, -1};
+    g_user_events[UserEventStart] = {-1, -1};
     return ORBIS_OK;
 }
 
@@ -125,7 +134,7 @@ s32 PS4_SYSV_ABI sceHmdReprojectionInitialize(const OrbisHmdReprojectionInitPara
         param->pipe_id > 6 || param->queue_id > 7 || type > 2) {
         return ORBIS_HMD_ERROR_PARAMETER_INVALID;
     }
-    Core::Xr::Runtime::Instance().SetFrameCallback(TriggerCompositorEvents);
+    Core::Xr::Runtime::Instance().SetFrameCallback(TriggerCompositorStart);
     g_reprojection_initialized = true;
     return ORBIS_OK;
 }
@@ -174,14 +183,14 @@ s32 PS4_SYSV_ABI sceHmdReprojectionSetOutputMinColor() {
 s32 PS4_SYSV_ABI sceHmdReprojectionSetUserEventEnd(s64 equeue, s32 id) {
     LOG_INFO(Lib_Hmd, "called, id = {}", id);
     std::scoped_lock lock{g_event_mutex};
-    g_user_events[1] = {equeue, id};
+    g_user_events[UserEventEnd] = {equeue, id};
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceHmdReprojectionSetUserEventStart(s64 equeue, s32 id) {
     LOG_INFO(Lib_Hmd, "called, id = {}", id);
     std::scoped_lock lock{g_event_mutex};
-    g_user_events[0] = {equeue, id};
+    g_user_events[UserEventStart] = {equeue, id};
     return ORBIS_OK;
 }
 

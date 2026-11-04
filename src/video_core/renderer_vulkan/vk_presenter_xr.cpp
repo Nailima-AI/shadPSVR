@@ -7,6 +7,10 @@
 
 namespace Vulkan {
 
+static bool IsSrgbFormat(vk::Format format) {
+    return format == vk::Format::eR8G8B8A8Srgb || format == vk::Format::eB8G8R8A8Srgb;
+}
+
 void Presenter::SubmitXrEyes(const std::array<AmdGpu::Image, 2>& eyes,
                              const Core::Xr::EyeSubmission& submission) {
     auto& xr = Core::Xr::Runtime::Instance();
@@ -25,7 +29,6 @@ void Presenter::SubmitXrEyes(const std::array<AmdGpu::Image, 2>& eyes,
     }
     if (xr.EnsureEyeSwapchains(submission.width, submission.height)) {
         for (u32 eye = 0; eye < 2; ++eye) {
-            xr_views[eye].clear();
             for (VkImage image : xr.GetEyeSwapchainImages(eye)) {
                 auto [result, view] = instance.GetDevice().createImageViewUnique({
                     .image = image,
@@ -37,22 +40,36 @@ void Presenter::SubmitXrEyes(const std::array<AmdGpu::Image, 2>& eyes,
                         .layerCount = 1,
                     },
                 });
-                ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create XR image view: {}",
-                           vk::to_string(result));
+                if (result != vk::Result::eSuccess) {
+                    LOG_ERROR(Render_Vulkan, "Failed to create XR image view: {}",
+                              vk::to_string(result));
+                    xr_views = {};
+                    return;
+                }
                 xr_views[eye].push_back(std::move(view));
             }
         }
     }
 
-    draw_scheduler.EndRendering();
-    const auto cmdbuf = draw_scheduler.CommandBuffer();
+    std::array<u32, 2> indices{};
+    for (u32 eye = 0; eye < 2; ++eye) {
+        const auto index = xr.AcquireEyeImage(eye);
+        if (!index || *index >= xr_views[eye].size()) {
+            return;
+        }
+        indices[eye] = *index;
+    }
+
+    // The post-processing shader encodes to sRGB itself, which an sRGB attachment would repeat.
+    const HostPasses::PostProcessingPass::Settings settings{.hdr = IsSrgbFormat(format) ? 1u : 0u};
     const vk::ImageSubresourceRange color_range{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .levelCount = 1,
         .layerCount = 1,
     };
 
-    std::array<bool, 2> acquired{};
+    draw_scheduler.EndRendering();
+    const auto cmdbuf = draw_scheduler.CommandBuffer();
     for (u32 eye = 0; eye < 2; ++eye) {
         VideoCore::TextureCache::ImageDesc desc{eyes[eye], Shader::ImageResource{}};
         desc.view_info.mapping.a = AmdGpu::CompSwizzle::One;
@@ -65,19 +82,12 @@ void Presenter::SubmitXrEyes(const std::array<AmdGpu::Image, 2>& eyes,
                         vk::AccessFlagBits2::eShaderRead);
         runtime.FlushBarriers();
 
-        const auto index = xr.AcquireEyeImage(eye);
-        if (!index || *index >= xr_views[eye].size()) {
-            continue;
-        }
-        acquired[eye] = true;
-        const auto images = xr.GetEyeSwapchainImages(eye);
         Frame target{
             .width = submission.width[eye],
             .height = submission.height[eye],
-            .image = images[*index],
-            .image_view = *xr_views[eye][*index],
+            .image = xr.GetEyeSwapchainImages(eye)[indices[eye]],
+            .image_view = *xr_views[eye][indices[eye]],
         };
-
         const vk::ImageMemoryBarrier2 to_attachment{
             .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
             .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
@@ -91,7 +101,7 @@ void Presenter::SubmitXrEyes(const std::array<AmdGpu::Image, 2>& eyes,
             {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_attachment});
 
         xr_pp_pass.Render(cmdbuf, image_view, {image.info.size.width, image.info.size.height},
-                          target, {});
+                          target, settings);
 
         const vk::ImageMemoryBarrier2 to_runtime{
             .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
@@ -108,14 +118,7 @@ void Presenter::SubmitXrEyes(const std::array<AmdGpu::Image, 2>& eyes,
     }
 
     draw_scheduler.Flush();
-    for (u32 eye = 0; eye < 2; ++eye) {
-        if (acquired[eye]) {
-            xr.ReleaseEyeImage(eye);
-        }
-    }
-    if (acquired[0] && acquired[1]) {
-        xr.PublishEyes(submission);
-    }
+    xr.PresentEyes(submission);
 }
 
 } // namespace Vulkan

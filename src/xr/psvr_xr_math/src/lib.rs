@@ -54,6 +54,16 @@ pub unsafe extern "C" fn pxm_tracking_space_recenter(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn pxm_tracking_space_recenter_orientation(
+    space: *mut TrackingSpace,
+    current_head: *const Pose,
+) {
+    deref_mut_or_return!(space);
+    deref_or_return!(current_head);
+    space.recenter_orientation(current_head);
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pxm_xr_pose_to_orbis(
     space: *const TrackingSpace,
     xr: *const Pose,

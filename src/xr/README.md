@@ -55,6 +55,11 @@ Rebind in SteamVR's controller settings for the "psvr" action set.
 - Untested on a commercial title. Verified only against Monado's simulated headset.
 - The Orbis origin is the head position at session start (or last recenter). Real PSVR positions
   are relative to the PS Camera; some titles may expect an offset.
+- The frame thread holds the Vulkan submit lock across `xrBeginFrame` / `xrEndFrame`, as
+  XR_KHR_vulkan_enable requires for queue access. If SteamVR blocks inside `xrEndFrame`, emulator
+  GPU submits wait with it: profile there first if the frame rate drops.
+- Eye textures are copied once the GPU queues are idle, after the title's earlier command
+  buffers. Titles that keep the GPU busy without a gap would delay the copy.
 - `label` in the reprojection frame parameters is never written. If a title waits on it, it will
   stall.
 - Move sphere offset (9 cm from the grip) and the Move axis convention (+Y along the shaft) come

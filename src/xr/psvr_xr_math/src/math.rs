@@ -245,6 +245,14 @@ impl TrackingSpace {
         self.recenter_origin = head.position;
     }
 
+    /// Makes `head`'s current heading Orbis forward without moving its Orbis position.
+    pub fn recenter_orientation(&mut self, head: &Pose) {
+        let orbis_position = self.pose_to_orbis(head).position;
+        let yaw = head.orientation.normalized().yaw_only();
+        self.recenter_yaw_inverse = yaw.conjugate();
+        self.recenter_origin = head.position - yaw.rotate(orbis_position - self.orbis_origin);
+    }
+
     pub fn pose_to_orbis(&self, xr: &Pose) -> Pose {
         Pose {
             orientation: (self.recenter_yaw_inverse * xr.orientation.normalized()).normalized(),
@@ -445,6 +453,38 @@ mod tests {
         approx_v(
             space.vector_to_orbis(Vec3::new(-1.0, 0.0, 0.0)),
             Vec3::new(0.0, 0.0, -1.0),
+        );
+    }
+
+    #[test]
+    fn orientation_recenter_keeps_position() {
+        let mut space = TrackingSpace::new(Vec3::new(0.0, 0.0, 1.5));
+        space.recenter(&Pose::IDENTITY);
+        let head = Pose {
+            orientation: Quat::from_axis_angle(UP, 1.2)
+                * Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), 0.3),
+            position: Vec3::new(0.5, 0.1, -0.4),
+        };
+        let before = space.pose_to_orbis(&head);
+        space.recenter_orientation(&head);
+        let after = space.pose_to_orbis(&head);
+        approx_v(after.position, before.position);
+        approx_q(
+            after.orientation,
+            Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), 0.3),
+        );
+        // Stepping forward in the new heading is Orbis forward.
+        let forward = head
+            .orientation
+            .yaw_only()
+            .rotate(Vec3::new(0.0, 0.0, -1.0));
+        let stepped = Pose {
+            position: head.position + forward,
+            ..head
+        };
+        approx_v(
+            space.pose_to_orbis(&stepped).position,
+            before.position + Vec3::new(0.0, 0.0, -1.0),
         );
     }
 

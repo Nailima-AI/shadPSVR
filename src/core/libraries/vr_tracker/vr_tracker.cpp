@@ -466,7 +466,7 @@ s32 PS4_SYSV_ABI sceVrTrackerResetOrientationRelative(const OrbisVrTrackerDevice
     LOG_INFO(Lib_VrTracker, "called, device_type = {}, handle = {}", static_cast<u32>(device_type),
              handle);
     if (device_type == OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_HMD) {
-        Core::Xr::Runtime::Instance().Recenter();
+        Core::Xr::Runtime::Instance().RecenterOrientation();
     }
     return ORBIS_OK;
 }

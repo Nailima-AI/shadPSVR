@@ -89,6 +89,13 @@ public:
         return num_submits == 0;
     }
 
+    /// Runs func on the GPU thread once every command buffer submitted so far has executed.
+    void SendCommandWhenIdle(auto&& func) {
+        std::scoped_lock lk{submit_mutex};
+        idle_command_queue.emplace(std::move(func));
+        submit_cv.notify_one();
+    }
+
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
         vo_port = port;
     }
@@ -193,6 +200,7 @@ private:
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
     void ProcessCommands();
+    void ProcessIdleCommands();
     void ProcessCeQueue();
     void Process(std::stop_token stoken);
     void HandleGetLodStats(const PM4CmdGetLodStats* get_lod);
@@ -236,6 +244,7 @@ private:
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
+    std::queue<Common::UniqueFunction<void>> idle_command_queue{};
     std::thread::id gpu_id;
 #ifdef __linux__
     u32 gpu_tid;

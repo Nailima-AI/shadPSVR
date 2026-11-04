@@ -78,7 +78,8 @@ struct Runtime::Impl {
 
     std::atomic<bool> session_running{false};
     std::atomic<bool> stop_requested{false};
-    std::atomic<bool> recenter_requested{true};
+    enum class RecenterMode : u32 { None, Full, Orientation };
+    std::atomic<RecenterMode> recenter_requested{RecenterMode::Full};
     std::jthread frame_thread;
 
     struct InputActions {
@@ -99,7 +100,8 @@ struct Runtime::Impl {
         u32 width{};
         u32 height{};
         std::vector<VkImage> images;
-        std::optional<u32> unwaited_index;
+        std::optional<u32> held_index;
+        bool held_ready{false};
     };
     s64 swapchain_format{};
     mutable std::mutex layer_mutex;
@@ -201,7 +203,7 @@ struct Runtime::Impl {
                 stop_requested = true;
                 break;
             case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
-                recenter_requested = true;
+                recenter_requested = RecenterMode::Full;
                 break;
             default:
                 break;
@@ -564,8 +566,15 @@ struct Runtime::Impl {
         std::scoped_lock lock{state_mutex};
         next.sequence = snapshot ? snapshot->sequence + 1 : 1;
         if (head_valid) {
-            if (recenter_requested.exchange(false)) {
+            switch (recenter_requested.exchange(RecenterMode::None)) {
+            case RecenterMode::Full:
                 pxm_tracking_space_recenter(&tracking_space, &xr_head);
+                break;
+            case RecenterMode::Orientation:
+                pxm_tracking_space_recenter_orientation(&tracking_space, &xr_head);
+                break;
+            case RecenterMode::None:
+                break;
             }
             pxm_xr_pose_to_orbis(&tracking_space, &xr_head, &next.head);
             for (int eye = 0; eye < 2; ++eye) {
@@ -686,20 +695,18 @@ struct Runtime::Impl {
     }
 };
 
+// Never destroyed: teardown happens in Shutdown() while the Vulkan device is still alive, and
+// by the time static destructors run the OpenXR loader may already be gone.
 Runtime& Runtime::Instance() {
-    static Runtime runtime;
-    return runtime;
+    static Runtime* runtime = new Runtime;
+    return *runtime;
 }
 
 Runtime::Runtime() : impl{std::make_unique<Impl>()} {
     pxm_tracking_space_init(&impl->tracking_space, PxmVec3{0.0f, 0.0f, 0.0f});
 }
 
-// Teardown happens in Shutdown() while the Vulkan device is still alive. By the time static
-// destructors run the OpenXR loader may already be gone, so the state is left to the OS.
-Runtime::~Runtime() {
-    static_cast<void>(impl.release());
-}
+Runtime::~Runtime() = default;
 
 bool Runtime::IsRequested() const {
     const char* value = std::getenv("SHADPS4_OPENXR");
@@ -860,12 +867,20 @@ bool Runtime::IsHeadsetActive() const {
 }
 
 std::optional<TrackingSnapshot> Runtime::GetTrackingSnapshot() const {
+    if (!impl->session_running) {
+        return std::nullopt;
+    }
     std::scoped_lock lock{impl->state_mutex};
     return impl->snapshot;
 }
 
 void Runtime::Recenter() {
-    impl->recenter_requested = true;
+    impl->recenter_requested = Impl::RecenterMode::Full;
+}
+
+void Runtime::RecenterOrientation() {
+    auto expected = Impl::RecenterMode::None;
+    impl->recenter_requested.compare_exchange_strong(expected, Impl::RecenterMode::Orientation);
 }
 
 void Runtime::SetVibration(Hand hand, float amplitude) {
@@ -926,13 +941,30 @@ bool Runtime::EnsureEyeSwapchains(const u32 width[2], const u32 height[2]) {
             return false;
         }
         u32 count = 0;
-        xrEnumerateSwapchainImages(swapchain.handle, 0, &count, nullptr);
-        std::vector<XrSwapchainImageVulkanKHR> images(count,
-                                                      {.type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
-        impl->Check(xrEnumerateSwapchainImages(
-                        swapchain.handle, count, &count,
-                        reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())),
-                    "xrEnumerateSwapchainImages");
+        std::vector<XrSwapchainImageVulkanKHR> images;
+        bool enumerated =
+            impl->Check(xrEnumerateSwapchainImages(swapchain.handle, 0, &count, nullptr),
+                        "xrEnumerateSwapchainImages");
+        if (enumerated && count > 0) {
+            images.assign(count, {.type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+            enumerated =
+                impl->Check(xrEnumerateSwapchainImages(
+                                swapchain.handle, count, &count,
+                                reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())),
+                            "xrEnumerateSwapchainImages");
+        }
+        enumerated &= count > 0 && std::ranges::none_of(images, [](const auto& image) {
+                          return image.image == VK_NULL_HANDLE;
+                      });
+        if (!enumerated) {
+            for (auto& created : impl->eye_swapchains) {
+                if (created.handle != XR_NULL_HANDLE) {
+                    xrDestroySwapchain(created.handle);
+                }
+                created = {};
+            }
+            return false;
+        }
         swapchain.width = width[eye];
         swapchain.height = height[eye];
         for (const auto& image : images) {
@@ -949,14 +981,19 @@ std::vector<VkImage_T*> Runtime::GetEyeSwapchainImages(u32 eye) const {
     return impl->eye_swapchains[eye].images;
 }
 
+// An acquired image stays held until PresentEyes, also across submissions that could not get
+// both eyes, so the two eyes always change together.
 std::optional<u32> Runtime::AcquireEyeImage(u32 eye) {
     XrSwapchain swapchain;
     std::optional<u32> index;
     {
         std::scoped_lock lock{impl->layer_mutex};
         auto& eye_swapchain = impl->eye_swapchains[eye];
+        if (eye_swapchain.held_index && eye_swapchain.held_ready) {
+            return eye_swapchain.held_index;
+        }
         swapchain = eye_swapchain.handle;
-        index = std::exchange(eye_swapchain.unwaited_index, std::nullopt);
+        index = eye_swapchain.held_index;
     }
     if (swapchain == XR_NULL_HANDLE) {
         return std::nullopt;
@@ -970,44 +1007,29 @@ std::optional<u32> Runtime::AcquireEyeImage(u32 eye) {
         }
         index = acquired;
     }
-    // An image that timed out stays acquired and has to be waited on again before release.
     const XrSwapchainImageWaitInfo wait_info{
         .type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,
         .timeout = 100'000'000,
     };
     const XrResult result = xrWaitSwapchainImage(swapchain, &wait_info);
-    if (result == XR_TIMEOUT_EXPIRED) {
-        std::scoped_lock lock{impl->layer_mutex};
-        if (impl->eye_swapchains[eye].handle == swapchain) {
-            impl->eye_swapchains[eye].unwaited_index = index;
-        }
+    const bool ready = result == XR_SUCCESS;
+    if (!ready && result != XR_TIMEOUT_EXPIRED) {
+        impl->Check(result, "xrWaitSwapchainImage");
+    }
+    std::scoped_lock lock{impl->layer_mutex};
+    auto& eye_swapchain = impl->eye_swapchains[eye];
+    if (eye_swapchain.handle != swapchain) {
         return std::nullopt;
     }
-    if (!impl->Check(result, "xrWaitSwapchainImage")) {
-        return std::nullopt;
-    }
-    return index;
+    eye_swapchain.held_index = index;
+    eye_swapchain.held_ready = ready;
+    return ready ? index : std::nullopt;
 }
 
-void Runtime::ReleaseEyeImage(u32 eye) {
-    std::scoped_lock lock{impl->layer_mutex, Vulkan::Scheduler::submit_mutex};
-    const XrSwapchain swapchain = impl->eye_swapchains[eye].handle;
-    if (swapchain != XR_NULL_HANDLE) {
-        impl->Check(xrReleaseSwapchainImage(swapchain, nullptr), "xrReleaseSwapchainImage");
-    }
-}
-
-void Runtime::PublishEyes(const EyeSubmission& submission) {
+void Runtime::PresentEyes(const EyeSubmission& submission) {
     const auto valid_fov = [](const PxmFov& fov) {
         return fov.angle_left < fov.angle_right && fov.angle_down < fov.angle_up;
     };
-    if (!valid_fov(submission.fov[0]) || !valid_fov(submission.fov[1])) {
-        static bool logged = false;
-        if (!std::exchange(logged, true)) {
-            LOG_ERROR(Lib_Hmd, "Ignoring an eye submission with an empty field of view");
-        }
-        return;
-    }
     PxmPose head_xr{};
     PxmVec3 eye_offsets[2]{};
     {
@@ -1017,7 +1039,24 @@ void Runtime::PublishEyes(const EyeSubmission& submission) {
             std::memcpy(eye_offsets, impl->snapshot->eye_offsets, sizeof(eye_offsets));
         }
     }
-    std::scoped_lock lock{impl->layer_mutex};
+
+    std::scoped_lock lock{impl->layer_mutex, Vulkan::Scheduler::submit_mutex};
+    auto& swapchains = impl->eye_swapchains;
+    if (!swapchains[0].held_ready || !swapchains[1].held_ready) {
+        return;
+    }
+    for (auto& swapchain : swapchains) {
+        impl->Check(xrReleaseSwapchainImage(swapchain.handle, nullptr), "xrReleaseSwapchainImage");
+        swapchain.held_index.reset();
+        swapchain.held_ready = false;
+    }
+    if (!valid_fov(submission.fov[0]) || !valid_fov(submission.fov[1])) {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            LOG_ERROR(Lib_Hmd, "Ignoring an eye submission with an empty field of view");
+        }
+        return;
+    }
     for (u32 eye = 0; eye < 2; ++eye) {
         PxmPose eye_pose{};
         pxm_pose_apply_local_offset(&head_xr, eye_offsets[eye], &eye_pose);
@@ -1026,13 +1065,12 @@ void Runtime::PublishEyes(const EyeSubmission& submission) {
         std::memcpy(&view.pose, &eye_pose, sizeof(view.pose));
         view.fov = {submission.fov[eye].angle_left, submission.fov[eye].angle_right,
                     submission.fov[eye].angle_up, submission.fov[eye].angle_down};
-        view.subImage.swapchain = impl->eye_swapchains[eye].handle;
+        view.subImage.swapchain = swapchains[eye].handle;
         view.subImage.imageRect = {
             {0, 0},
             {static_cast<s32>(submission.width[eye]), static_cast<s32>(submission.height[eye])}};
     }
-    impl->layer_ready = impl->eye_swapchains[0].handle != XR_NULL_HANDLE &&
-                        impl->eye_swapchains[1].handle != XR_NULL_HANDLE;
+    impl->layer_ready = true;
 }
 
 } // namespace Core::Xr

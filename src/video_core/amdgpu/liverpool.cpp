@@ -121,6 +121,21 @@ void Liverpool::ProcessCommands() {
     }
 }
 
+void Liverpool::ProcessIdleCommands() {
+    while (true) {
+        Common::UniqueFunction<void> callback{};
+        {
+            std::scoped_lock lk{submit_mutex};
+            if (idle_command_queue.empty()) {
+                return;
+            }
+            callback = std::move(idle_command_queue.front());
+            idle_command_queue.pop();
+        }
+        callback();
+    }
+}
+
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
@@ -131,8 +146,9 @@ void Liverpool::Process(std::stop_token stoken) {
     while (!stoken.stop_requested()) {
         {
             std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(submit_cv, lk, stoken,
-                                [this] { return num_commands || num_submits || submit_done; });
+            Common::CondvarWait(submit_cv, lk, stoken, [this] {
+                return num_commands || num_submits || submit_done || !idle_command_queue.empty();
+            });
         }
         if (stoken.stop_requested()) {
             break;
@@ -181,6 +197,7 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
 
+        ProcessIdleCommands();
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
 }

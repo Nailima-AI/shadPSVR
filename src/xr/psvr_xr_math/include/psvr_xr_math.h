@@ -53,6 +53,7 @@ typedef struct PxmMoveState {
 
 void pxm_tracking_space_init(PxmTrackingSpace* space, PxmVec3 orbis_origin);
 void pxm_tracking_space_recenter(PxmTrackingSpace* space, const PxmPose* current_head);
+void pxm_tracking_space_recenter_orientation(PxmTrackingSpace* space, const PxmPose* current_head);
 void pxm_xr_pose_to_orbis(const PxmTrackingSpace* space, const PxmPose* xr, PxmPose* out);
 void pxm_xr_vector_to_orbis(const PxmTrackingSpace* space, PxmVec3 xr, PxmVec3* out);
 void pxm_eye_offset(const PxmPose* head, const PxmPose* eye, PxmVec3* out);
