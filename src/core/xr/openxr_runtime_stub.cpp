@@ -75,6 +75,10 @@ void Runtime::RecenterOrientation() {}
 
 void Runtime::SetVibration(Hand, float) {}
 
+float Runtime::GetVirtualCameraHeight() const {
+    return 0.0f;
+}
+
 void Runtime::SetFrameCallback(std::function<void()>) {}
 
 s64 Runtime::GetSwapchainFormat() const {

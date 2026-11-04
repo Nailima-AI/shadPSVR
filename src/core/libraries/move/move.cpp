@@ -18,7 +18,7 @@ namespace Libraries::Move {
 static bool g_library_initialized = false;
 
 static constexpr s32 MaxControllers = 2;
-static constexpr float SphereRadius = 0.0225f;
+static constexpr float SphereRadius = 0.023f;
 static std::array<s32, MaxControllers> g_handles{-1, -1};
 
 static constexpr std::array<std::pair<u32, u16>, 7> ButtonMap{{
@@ -74,7 +74,8 @@ static void FillMoveData(const Core::Xr::ControllerSnapshot& controller,
         }
     }
     const u16 trigger = static_cast<u16>(std::clamp(controller.trigger, 0.0f, 1.0f) * 255.0f);
-    if (trigger >= 128) {
+    // A real Move sets T from about 16 % of the trigger's travel (ALVR-PS4, measured).
+    if (trigger >= 41) {
         buttons |= ORBIS_MOVE_BUTTON_T;
     }
     data->button_data.button_data = buttons;

@@ -53,8 +53,8 @@ Rebind in SteamVR's controller settings for the "psvr" action set.
 ## Known gaps and guesses
 
 - Untested on a commercial title. Verified only against Monado's simulated headset.
-- The Orbis origin is the head position at session start (or last recenter). Real PSVR positions
-  are relative to the PS Camera; some titles may expect an offset.
+- Positions are relative to a virtual camera 1.4 m high and 2 m in front of the player
+  (configurable, see [CAMERA.md](CAMERA.md#tracking-space-verified-by-alvr-ps4-on-hardware)).
 - The frame thread holds the Vulkan submit lock across `xrBeginFrame` / `xrEndFrame`, as
   XR_KHR_vulkan_enable requires for queue access. If SteamVR blocks inside `xrEndFrame`, emulator
   GPU submits wait with it: profile there first if the frame rate drops.
@@ -63,7 +63,6 @@ Rebind in SteamVR's controller settings for the "psvr" action set.
   it was rendered with, so its reprojection removes the difference.
 - `label` in the reprojection frame parameters is never written. If a title waits on it, it will
   stall.
-- Move sphere offset (9 cm from the grip) and the Move axis convention (+Y along the shaft) come
-  from psmoveapi and PS3 libgem; PS4 may differ.
+- The Move sphere's distance from the OpenXR grip (9 cm) is an estimate.
 - Struct layouts for the reprojection calls come from ALVR-PS4's hardware notes
   (github.com/nicolas-riera/ALVR-PS4, `docs/psvr-technical-reference.md`).

@@ -238,11 +238,13 @@ impl TrackingSpace {
         }
     }
 
-    /// Makes `head`'s current position the Orbis origin and its heading Orbis forward.
-    /// Pitch and roll are kept so the horizon stays level.
-    pub fn recenter(&mut self, head: &Pose) {
+    /// Puts the virtual camera in front of `head`, facing it: `head`'s heading becomes Orbis
+    /// -Z, and the point on the floor below it maps to `orbis_origin`'s floor point. `floor_y`
+    /// is the floor's height in the OpenXR space. Pitch and roll are kept so the horizon stays
+    /// level.
+    pub fn recenter(&mut self, head: &Pose, floor_y: f32) {
         self.recenter_yaw_inverse = head.orientation.normalized().yaw_only().conjugate();
-        self.recenter_origin = head.position;
+        self.recenter_origin = Vec3::new(head.position.x, floor_y, head.position.z);
     }
 
     /// Makes `head`'s current heading Orbis forward without moving its Orbis position.
@@ -330,6 +332,28 @@ pub fn fov_from_uv_block(block: [f32; 4]) -> Fov {
     }
 }
 
+/// Neck pivot relative to the eye centre, head frame: Oculus SDK's default neck model
+/// (`OVR_DEFAULT_NECK_TO_EYE_*`). The PS4 tracker's head pose behaves like this neck point.
+pub const EYE_TO_NECK: Vec3 = Vec3::new(0.0, -0.075, 0.0805);
+/// Headset body (the front LED cluster) relative to the eye centre, head frame. Estimated:
+/// no public measurement exists.
+pub const EYE_TO_DEVICE: Vec3 = Vec3::new(0.0, 0.0, -0.06);
+
+/// Device and head (neck) poses the PS4 tracker reports, derived from the eye centre.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HmdBodyPoses {
+    pub device: Pose,
+    pub head: Pose,
+}
+
+pub fn hmd_body_poses(eye_center: &Pose) -> HmdBodyPoses {
+    HmdBodyPoses {
+        device: eye_center.apply_local_offset(EYE_TO_DEVICE),
+        head: eye_center.apply_local_offset(EYE_TO_NECK),
+    }
+}
+
 /// Output of [`move_from_grip`]: what libSceMove and libSceVrTracker report for a PS Move.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -342,25 +366,30 @@ pub struct MoveState {
     pub gyro: Vec3,
 }
 
-/// Distance from the OpenXR grip origin (centre of the fist) to the Move's sphere centre.
-pub const MOVE_SPHERE_OFFSET: f32 = 0.09;
+/// Distance from the OpenXR grip origin (centre of the fist) to the point the PS4 tracker
+/// reports for a Move: 8 mm short of the sphere centre, towards the handle (ALVR-PS4,
+/// measured), with the sphere centre estimated 9 cm from the fist.
+pub const MOVE_TRACKED_POINT_OFFSET: f32 = 0.09 - 0.008;
 
-/// Rotates Move-local axes into grip-local axes. OpenXR grip -Z runs out of the fist along the
-/// controller, which is the Move's shaft (+Y), and grip +Y is the button face (+Z on the Move).
-pub fn move_from_grip_rotation() -> Quat {
+/// Rotates the Move's IMU axes into grip axes. The tracker's Move pose uses the grip's own
+/// axes (forward from handle to sphere is -Z), but the IMU reads +Y along the shaft.
+pub fn move_imu_from_grip_rotation() -> Quat {
     Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), -std::f32::consts::FRAC_PI_2)
 }
 
 pub fn move_from_grip(grip: &Pose, angular_velocity: Vec3) -> MoveState {
-    let orientation = (grip.orientation.normalized() * move_from_grip_rotation()).normalized();
-    let inverse = orientation.conjugate();
+    let orientation = grip.orientation.normalized();
+    let imu_inverse = (orientation * move_imu_from_grip_rotation())
+        .normalized()
+        .conjugate();
     MoveState {
         sphere: Pose {
             orientation,
-            position: grip.position + orientation.rotate(Vec3::new(0.0, MOVE_SPHERE_OFFSET, 0.0)),
+            position: grip.position
+                + orientation.rotate(Vec3::new(0.0, 0.0, -MOVE_TRACKED_POINT_OFFSET)),
         },
-        accelerometer: inverse.rotate(Vec3::new(0.0, 1.0, 0.0)),
-        gyro: inverse.rotate(angular_velocity),
+        accelerometer: imu_inverse.rotate(Vec3::new(0.0, 1.0, 0.0)),
+        gyro: imu_inverse.rotate(angular_velocity),
     }
 }
 
@@ -417,16 +446,18 @@ mod tests {
     }
 
     #[test]
-    fn recenter_puts_head_at_origin_facing_forward() {
-        let mut space = TrackingSpace::new(Vec3::ZERO);
+    fn recenter_places_head_in_front_of_camera() {
+        // Camera 1 m above the floor, player 2 m in front of it.
+        let mut space = TrackingSpace::new(Vec3::new(0.0, -1.0, 2.0));
         let head = Pose {
             orientation: Quat::from_axis_angle(UP, PI * 0.75)
                 * Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), 0.2),
             position: Vec3::new(2.0, 1.6, -3.0),
         };
-        space.recenter(&head);
+        space.recenter(&head, 0.0);
         let out = space.pose_to_orbis(&head);
-        approx_v(out.position, Vec3::ZERO);
+        // Eyes 1.6 m above the floor are 0.6 m above the camera.
+        approx_v(out.position, Vec3::new(0.0, 0.6, 2.0));
         approx_q(
             out.orientation,
             Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), 0.2),
@@ -440,7 +471,7 @@ mod tests {
             orientation: Quat::from_axis_angle(UP, FRAC_PI_2),
             position: Vec3::ZERO,
         };
-        space.recenter(&head);
+        space.recenter(&head, 0.0);
         // Head faces world -X; stepping along -X must become stepping forward (-Z).
         let stepped = Pose {
             position: Vec3::new(-1.0, 0.0, 0.0),
@@ -459,7 +490,7 @@ mod tests {
     #[test]
     fn orientation_recenter_keeps_position() {
         let mut space = TrackingSpace::new(Vec3::new(0.0, 0.0, 1.5));
-        space.recenter(&Pose::IDENTITY);
+        space.recenter(&Pose::IDENTITY, 0.0);
         let head = Pose {
             orientation: Quat::from_axis_angle(UP, 1.2)
                 * Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), 0.3),
@@ -579,9 +610,13 @@ mod tests {
         approx_v(state.accelerometer, Vec3::new(0.0, 1.0, 0.0));
         approx_v(
             state.sphere.position,
-            Vec3::new(0.2, 1.0 + MOVE_SPHERE_OFFSET, -0.3),
+            Vec3::new(0.2, 1.0 + MOVE_TRACKED_POINT_OFFSET, -0.3),
         );
-        approx_q(state.sphere.orientation, Quat::IDENTITY);
+        // The pose's forward (-Z) points from the handle to the sphere, here straight up.
+        approx_v(
+            state.sphere.orientation.rotate(Vec3::new(0.0, 0.0, -1.0)),
+            Vec3::new(0.0, 1.0, 0.0),
+        );
     }
 
     #[test]
@@ -589,7 +624,7 @@ mod tests {
         let state = move_from_grip(&Pose::IDENTITY, Vec3::ZERO);
         approx_v(
             state.sphere.position,
-            Vec3::new(0.0, 0.0, -MOVE_SPHERE_OFFSET),
+            Vec3::new(0.0, 0.0, -MOVE_TRACKED_POINT_OFFSET),
         );
         // Lying flat, buttons up: gravity reaction comes out of the button face (+Z).
         approx_v(state.accelerometer, Vec3::new(0.0, 0.0, 1.0));
@@ -609,10 +644,13 @@ mod tests {
     #[test]
     fn pose_to_xr_inverts_pose_to_orbis() {
         let mut space = TrackingSpace::new(Vec3::new(0.0, 0.0, 1.5));
-        space.recenter(&Pose {
-            orientation: Quat::from_axis_angle(UP, 0.8),
-            position: Vec3::new(1.0, 1.7, -2.0),
-        });
+        space.recenter(
+            &Pose {
+                orientation: Quat::from_axis_angle(UP, 0.8),
+                position: Vec3::new(1.0, 1.7, -2.0),
+            },
+            0.3,
+        );
         let xr = Pose {
             orientation: Quat::from_axis_angle(Vec3::new(1.0, 2.0, 0.5), 0.6),
             position: Vec3::new(0.3, 1.2, 0.4),
@@ -646,6 +684,19 @@ mod tests {
     }
 
     #[test]
+    fn neck_sits_below_and_behind_the_eyes() {
+        let eyes = Pose {
+            orientation: Quat::from_axis_angle(UP, FRAC_PI_2),
+            position: Vec3::new(0.0, 1.6, 0.0),
+        };
+        let poses = hmd_body_poses(&eyes);
+        // Facing world -X: "behind" is +X, the device is in front at -X.
+        approx_v(poses.head.position, Vec3::new(0.0805, 1.525, 0.0));
+        approx_v(poses.device.position, Vec3::new(-0.06, 1.6, 0.0));
+        approx_q(poses.head.orientation, eyes.orientation);
+    }
+
+    #[test]
     fn layouts_match_c_header() {
         assert_eq!(std::mem::size_of::<Vec3>(), 12);
         assert_eq!(std::mem::size_of::<Quat>(), 16);
@@ -655,5 +706,6 @@ mod tests {
         assert_eq!(std::mem::size_of::<OrbisFov>(), 16);
         assert_eq!(std::mem::size_of::<TrackingSpace>(), 40);
         assert_eq!(std::mem::size_of::<MoveState>(), 52);
+        assert_eq!(std::mem::size_of::<HmdBodyPoses>(), 56);
     }
 }

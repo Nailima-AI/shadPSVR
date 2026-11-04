@@ -45,7 +45,9 @@ struct ControllerSnapshot {
 struct TrackingSnapshot {
     bool head_valid;
     u64 sequence;
+    // Eye centre, headset body and neck pivot, as libSceVrTracker reports them.
     PxmPose head;
+    PxmHmdBodyPoses body;
     PxmPose eyes[2];
     PxmVec3 eye_offsets[2];
     PxmOrbisFov fov;
@@ -88,6 +90,7 @@ public:
     void Recenter();
     void RecenterOrientation();
     void SetVibration(Hand hand, float amplitude);
+    float GetVirtualCameraHeight() const;
 
     // Called once per headset frame from the frame loop, right after xrWaitFrame.
     void SetFrameCallback(std::function<void()> callback);

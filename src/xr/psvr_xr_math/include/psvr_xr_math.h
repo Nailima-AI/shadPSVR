@@ -51,8 +51,14 @@ typedef struct PxmMoveState {
     PxmVec3 gyro;
 } PxmMoveState;
 
+typedef struct PxmHmdBodyPoses {
+    PxmPose device;
+    PxmPose head;
+} PxmHmdBodyPoses;
+
 void pxm_tracking_space_init(PxmTrackingSpace* space, PxmVec3 orbis_origin);
-void pxm_tracking_space_recenter(PxmTrackingSpace* space, const PxmPose* current_head);
+void pxm_tracking_space_recenter(PxmTrackingSpace* space, const PxmPose* current_head,
+                                 float floor_y);
 void pxm_tracking_space_recenter_orientation(PxmTrackingSpace* space, const PxmPose* current_head);
 void pxm_xr_pose_to_orbis(const PxmTrackingSpace* space, const PxmPose* xr, PxmPose* out);
 void pxm_xr_vector_to_orbis(const PxmTrackingSpace* space, PxmVec3 xr, PxmVec3* out);
@@ -62,6 +68,7 @@ void pxm_fov_to_orbis(const PxmFov* left, const PxmFov* right, PxmOrbisFov* out)
 void pxm_pose_apply_local_offset(const PxmPose* pose, PxmVec3 offset, PxmPose* out);
 void pxm_orbis_pose_to_xr(const PxmTrackingSpace* space, const PxmPose* orbis, PxmPose* out);
 void pxm_fov_from_uv_block(const float block[4], PxmFov* out);
+void pxm_hmd_body_poses(const PxmPose* eye_center, PxmHmdBodyPoses* out);
 void pxm_move_from_grip(const PxmPose* grip, PxmVec3 angular_velocity, PxmMoveState* out);
 
 #ifdef __cplusplus

@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -57,6 +58,40 @@ constexpr XrPosef IdentityPose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
 } // Anonymous namespace
 
 static_assert(sizeof(PxmPose) == sizeof(XrPosef));
+
+namespace {
+
+float EnvironmentFloat(const char* name, float fallback, float min, float max) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return fallback;
+    }
+    char* end = nullptr;
+    const float parsed = std::strtof(value, &end);
+    if (end == value || !std::isfinite(parsed) || parsed < min || parsed > max) {
+        LOG_ERROR(Lib_Hmd, "Ignoring {}={}, expected {} to {}", name, value, min, max);
+        return fallback;
+    }
+    return parsed;
+}
+
+} // Anonymous namespace
+
+// Where the emulated PlayStation Camera sits relative to the player, in metres. The PS4
+// tracker's origin is the camera: +Y up, the camera looking towards +Z at the player.
+struct VirtualCameraPlacement {
+    float camera_height;
+    float camera_distance;
+    float eye_height;
+
+    static VirtualCameraPlacement FromEnvironment() {
+        return {
+            .camera_height = EnvironmentFloat("SHADPS4_PSVR_CAMERA_HEIGHT", 1.4f, 0.0f, 3.0f),
+            .camera_distance = EnvironmentFloat("SHADPS4_PSVR_CAMERA_DISTANCE", 2.0f, 0.6f, 4.0f),
+            .eye_height = EnvironmentFloat("SHADPS4_PSVR_EYE_HEIGHT", 1.2f, 0.5f, 2.5f),
+        };
+    }
+};
 
 struct Runtime::Impl {
     XrInstance instance{XR_NULL_HANDLE};
@@ -111,6 +146,14 @@ struct Runtime::Impl {
 
     std::mutex callback_mutex;
     std::function<void()> frame_callback;
+
+    VirtualCameraPlacement placement = VirtualCameraPlacement::FromEnvironment();
+    bool floor_known{false};
+
+    // Without a STAGE space the floor is assumed to sit eye_height below the head.
+    float FloorHeight(const PxmPose& head) const {
+        return floor_known ? 0.0f : head.position.y - placement.eye_height;
+    }
 
     mutable std::mutex state_mutex;
     PxmTrackingSpace tracking_space{};
@@ -574,7 +617,7 @@ struct Runtime::Impl {
         if (head_valid) {
             switch (recenter_requested.exchange(RecenterMode::None)) {
             case RecenterMode::Full:
-                pxm_tracking_space_recenter(&tracking_space, &xr_head);
+                pxm_tracking_space_recenter(&tracking_space, &xr_head, FloorHeight(xr_head));
                 break;
             case RecenterMode::Orientation:
                 pxm_tracking_space_recenter_orientation(&tracking_space, &xr_head);
@@ -583,6 +626,7 @@ struct Runtime::Impl {
                 break;
             }
             pxm_xr_pose_to_orbis(&tracking_space, &xr_head, &next.head);
+            pxm_hmd_body_poses(&next.head, &next.body);
             for (int eye = 0; eye < 2; ++eye) {
                 pxm_xr_pose_to_orbis(&tracking_space, &xr_eyes[eye], &next.eyes[eye]);
             }
@@ -595,6 +639,7 @@ struct Runtime::Impl {
             }
         } else if (snapshot) {
             next.head = snapshot->head;
+            next.body = snapshot->body;
             std::memcpy(next.eyes, snapshot->eyes, sizeof(next.eyes));
             std::memcpy(next.eye_offsets, snapshot->eye_offsets, sizeof(next.eye_offsets));
             next.fov = snapshot->fov;
@@ -710,7 +755,8 @@ Runtime& Runtime::Instance() {
 }
 
 Runtime::Runtime() : impl{std::make_unique<Impl>()} {
-    pxm_tracking_space_init(&impl->tracking_space, PxmVec3{0.0f, 0.0f, 0.0f});
+    pxm_tracking_space_init(&impl->tracking_space, PxmVec3{0.0f, -impl->placement.camera_height,
+                                                           impl->placement.camera_distance});
 }
 
 Runtime::~Runtime() = default;
@@ -831,16 +877,28 @@ bool Runtime::CreateSession(VkInstance instance, VkPhysicalDevice physical_devic
         return false;
     }
 
+    // STAGE puts the floor at y = 0, which the virtual camera height is measured from.
+    u32 space_count = 0;
+    std::vector<XrReferenceSpaceType> spaces;
+    if (XR_SUCCEEDED(xrEnumerateReferenceSpaces(impl->session, 0, &space_count, nullptr))) {
+        spaces.resize(space_count);
+        xrEnumerateReferenceSpaces(impl->session, space_count, &space_count, spaces.data());
+    }
+    impl->floor_known = std::ranges::find(spaces, XR_REFERENCE_SPACE_TYPE_STAGE) != spaces.end();
     XrReferenceSpaceCreateInfo space_info{
         .type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO,
-        .referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL,
+        .referenceSpaceType =
+            impl->floor_known ? XR_REFERENCE_SPACE_TYPE_STAGE : XR_REFERENCE_SPACE_TYPE_LOCAL,
         .poseInReferenceSpace = IdentityPose,
     };
     if (!impl->Check(xrCreateReferenceSpace(impl->session, &space_info, &impl->local_space),
-                     "xrCreateReferenceSpace(LOCAL)")) {
+                     "xrCreateReferenceSpace")) {
         impl->DestroySession();
         return false;
     }
+    LOG_INFO(Lib_Hmd, "OpenXR tracking space: {}, virtual camera {:.2f} m high, {:.2f} m away",
+             impl->floor_known ? "STAGE" : "LOCAL", impl->placement.camera_height,
+             impl->placement.camera_distance);
     space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     if (!impl->Check(xrCreateReferenceSpace(impl->session, &space_info, &impl->view_space),
                      "xrCreateReferenceSpace(VIEW)")) {
@@ -888,6 +946,10 @@ void Runtime::Recenter() {
 void Runtime::RecenterOrientation() {
     auto expected = Impl::RecenterMode::None;
     impl->recenter_requested.compare_exchange_strong(expected, Impl::RecenterMode::Orientation);
+}
+
+float Runtime::GetVirtualCameraHeight() const {
+    return impl->placement.camera_height;
 }
 
 void Runtime::SetVibration(Hand hand, float amplitude) {

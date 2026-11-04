@@ -19,7 +19,7 @@
 
 mod math;
 
-pub use math::{Fov, MoveState, OrbisFov, Pose, Quat, TrackingSpace, Vec3};
+pub use math::{Fov, HmdBodyPoses, MoveState, OrbisFov, Pose, Quat, TrackingSpace, Vec3};
 
 macro_rules! deref_or_return {
     ($($name:ident),+) => {
@@ -47,10 +47,11 @@ pub unsafe extern "C" fn pxm_tracking_space_init(space: *mut TrackingSpace, orbi
 pub unsafe extern "C" fn pxm_tracking_space_recenter(
     space: *mut TrackingSpace,
     current_head: *const Pose,
+    floor_y: f32,
 ) {
     deref_mut_or_return!(space);
     deref_or_return!(current_head);
-    space.recenter(current_head);
+    space.recenter(current_head, floor_y);
 }
 
 #[no_mangle]
@@ -119,6 +120,13 @@ pub unsafe extern "C" fn pxm_pose_apply_local_offset(
     deref_or_return!(pose);
     deref_mut_or_return!(out);
     *out = pose.apply_local_offset(offset);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pxm_hmd_body_poses(eye_center: *const Pose, out: *mut HmdBodyPoses) {
+    deref_or_return!(eye_center);
+    deref_mut_or_return!(out);
+    *out = math::hmd_body_poses(eye_center);
 }
 
 #[no_mangle]

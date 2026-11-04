@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <iterator>
 
@@ -113,8 +114,8 @@ static void FillHmdResult(const Core::Xr::TrackingSnapshot& snapshot,
     } else if (snapshot.has_velocity) {
         FillVelocity(snapshot.linear_velocity, snapshot.angular_velocity, result);
     }
-    FillPose(result->hmd_info.device_pose, snapshot.head);
-    FillPose(result->hmd_info.head_pose, snapshot.head);
+    FillPose(result->hmd_info.device_pose, snapshot.body.device);
+    FillPose(result->hmd_info.head_pose, snapshot.body.head);
     FillPose(result->hmd_info.left_eye_pose, snapshot.eyes[0]);
     FillPose(result->hmd_info.right_eye_pose, snapshot.eyes[1]);
     result->hmd_info.rear_tracking_status = ORBIS_VR_TRACKER_REAR_TRACKING_READY;
@@ -310,8 +311,43 @@ s32 PS4_SYSV_ABI sceVrTrackerCpuProcess(const OrbisVrTrackerCpuProcessParam* par
     return ORBIS_OK;
 }
 
+// Sony's play area: 0.6 m to 3 m in front of the camera and 1.9 m across, inside the camera's
+// roughly 72 by 48 degree view.
+static bool IsOutOfPlayArea(const PxmVec3& position, f32 camera_height) {
+    constexpr f32 MinDistance = 0.6f;
+    constexpr f32 MaxDistance = 3.0f;
+    constexpr f32 MaxHalfWidth = 0.95f;
+    constexpr f32 TanHalfHorizontal = 0.7265f;
+    constexpr f32 TanHalfVertical = 0.4452f;
+    const f32 distance = position.z;
+    if (distance < MinDistance || distance > MaxDistance) {
+        return true;
+    }
+    const f32 half_width = std::min(MaxHalfWidth, distance * TanHalfHorizontal);
+    const f32 half_height = distance * TanHalfVertical;
+    return std::abs(position.x) > half_width || position.y > half_height ||
+           position.y < std::max(-camera_height, -half_height);
+}
+
 s32 PS4_SYSV_ABI sceVrTrackerGetPlayAreaWarningInfo(OrbisVrTrackerPlayAreaWarningInfo* info) {
     LOG_TRACE(Lib_VrTracker, "called");
+    if (!Core::Xr::Runtime::Instance().IsRequested()) {
+        return ORBIS_OK;
+    }
+    if (!g_library_initialized) {
+        return ORBIS_VR_TRACKER_ERROR_NOT_INIT;
+    }
+    if (info == nullptr || info->size != sizeof(OrbisVrTrackerPlayAreaWarningInfo)) {
+        return ORBIS_VR_TRACKER_ERROR_ARGUMENT_INVALID;
+    }
+    const u32 size = info->size;
+    std::memset(info, 0, sizeof(OrbisVrTrackerPlayAreaWarningInfo));
+    info->size = size;
+    if (const auto snapshot = Core::Xr::Runtime::Instance().GetTrackingSnapshot();
+        snapshot && snapshot->head_valid) {
+        info->is_out_of_play_area = IsOutOfPlayArea(
+            snapshot->head.position, Core::Xr::Runtime::Instance().GetVirtualCameraHeight());
+    }
     return ORBIS_OK;
 }
 

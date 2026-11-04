@@ -11,6 +11,41 @@
   the whole `OrbisCameraFrameData`) → `GpuWait` / `CpuProcess` → `sceVrTrackerGetResult`. Titles
   with social or AR features also read the pixels themselves.
 
+## Tracking space (verified by ALVR-PS4 on hardware)
+
+- Origin at the PS Camera, metres, +Y up, right-handed. The camera looks towards +Z; a player
+  facing it looks towards -Z and stands at positive Z.
+- The floor is not reported: it is at `y = -(camera height)`.
+- Headset results: `left/right_eye_pose` include the IPD, `device_pose` is the headset body (not
+  at eye level), and `head_pose` behaves like a neck point.
+- Move results: the tracked point is 8 mm short of the sphere centre towards the handle, and the
+  pose's forward axis (handle to sphere) is local -Z. The IMU reads +Y along the shaft. T is set
+  from about 16 % of trigger travel.
+- The tracker works at 60 camera frames per second. Asking for poses 40–70 ms ahead jitters;
+  a few milliseconds is fine.
+
+Sony's setup guidance: camera about 1.4 m high, player 1.5–2.0 m away (2 m optimum), play
+area 1.9 m wide by 3 m deep starting about 0.6 m from the camera, each lens 85° diagonal.
+
+How the fork maps OpenXR onto it:
+
+| Value | Default | Override | Source |
+| --- | --- | --- | --- |
+| Camera height above floor | 1.4 m | `SHADPS4_PSVR_CAMERA_HEIGHT` | Sony |
+| Player distance from camera | 2.0 m | `SHADPS4_PSVR_CAMERA_DISTANCE` | Sony |
+| Eye height when the runtime has no STAGE space | 1.2 m (seated) | `SHADPS4_PSVR_EYE_HEIGHT` | estimate |
+| Neck pivot from eye centre | 7.5 cm down, 8.05 cm back | – | Oculus SDK neck model |
+| Headset body from eye centre | 6 cm forward | – | estimate, no public data |
+| Move tracked point from grip | 8.2 cm forward | – | ALVR-PS4 + estimate |
+
+Recentering puts the virtual camera in front of the player's current heading, at the configured
+height and distance. The floor comes from OpenXR's STAGE space when available.
+`sceVrTrackerGetPlayAreaWarningInfo` reports leaving the area above (cone of about 72° x 48°).
+
+Still unknown: the camera accelerometer in `OrbisCameraMeta` (units and axes), what feeds
+`camera_orientation`, the exact device-pose offset, and whether titles hand
+`sceHmdReprojectionStart` the eye-centre pose or the neck pose. The fork assumes the eye centre.
+
 ## Spoof (what this fork does)
 
 With `SHADPS4_OPENXR=1` and no host camera selected (`camera_id = -1`):
