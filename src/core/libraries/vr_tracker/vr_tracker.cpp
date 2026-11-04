@@ -279,8 +279,11 @@ s32 PS4_SYSV_ABI sceVrTrackerRegisterDeviceInternal(const OrbisVrTrackerDeviceTy
         if (IsMoveHandleRegistered(handle)) {
             return ORBIS_VR_TRACKER_ERROR_DEVICE_ALREADY_REGISTERED;
         }
-        s32* slot = std::ranges::find(g_move_handles, -1);
-        if (slot == std::end(g_move_handles)) {
+        // Without OpenXR only one Move can be registered, as before.
+        const auto slots =
+            Core::Xr::Runtime::Instance().IsRequested() ? std::size(g_move_handles) : 1;
+        s32* slot = std::find(g_move_handles, g_move_handles + slots, -1);
+        if (slot == g_move_handles + slots) {
             return ORBIS_VR_TRACKER_ERROR_DEVICE_ALREADY_REGISTERED;
         }
         *slot = handle;
@@ -315,6 +318,9 @@ s32 PS4_SYSV_ABI sceVrTrackerGetPlayAreaWarningInfo(OrbisVrTrackerPlayAreaWarnin
 s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param,
                                        OrbisVrTrackerResultData* result) {
     LOG_TRACE(Lib_VrTracker, "called");
+    if (!Core::Xr::Runtime::Instance().IsRequested()) {
+        return ORBIS_OK;
+    }
     if (!g_library_initialized) {
         return ORBIS_VR_TRACKER_ERROR_NOT_INIT;
     }

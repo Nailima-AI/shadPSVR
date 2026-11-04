@@ -101,6 +101,7 @@ void Liverpool::ProcessCeQueue() {
         task.destroy();
         std::scoped_lock lock{queue.m_access};
         ce_submits.pop();
+        ++num_ce_completed;
         --num_submits;
         std::scoped_lock lock2{submit_mutex};
         submit_cv.notify_all();
@@ -121,16 +122,25 @@ void Liverpool::ProcessCommands() {
     }
 }
 
-void Liverpool::ProcessIdleCommands() {
+void Liverpool::ProcessDeferredCommands() {
     while (true) {
         Common::UniqueFunction<void> callback{};
         {
             std::scoped_lock lk{submit_mutex};
-            if (idle_command_queue.empty()) {
+            if (deferred_commands.empty()) {
                 return;
             }
-            callback = std::move(idle_command_queue.front());
-            idle_command_queue.pop();
+            const auto& command = deferred_commands.front();
+            if (num_ce_completed < command.ce_target) {
+                return;
+            }
+            for (u32 i = 0; i < NumTotalQueues; ++i) {
+                if (mapped_queues[i].num_completed < command.queue_targets[i]) {
+                    return;
+                }
+            }
+            callback = std::move(deferred_commands.front().callback);
+            deferred_commands.pop();
         }
         callback();
     }
@@ -147,7 +157,7 @@ void Liverpool::Process(std::stop_token stoken) {
         {
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken, [this] {
-                return num_commands || num_submits || submit_done || !idle_command_queue.empty();
+                return num_commands || num_submits || submit_done || !deferred_commands.empty();
             });
         }
         if (stoken.stop_requested()) {
@@ -179,12 +189,16 @@ void Liverpool::Process(std::stop_token stoken) {
             if (task.done()) {
                 task.destroy();
 
-                std::scoped_lock lock{queue.m_access};
-                queue.submits.pop();
+                {
+                    std::scoped_lock lock{queue.m_access};
+                    queue.submits.pop();
+                    ++queue.num_completed;
 
-                --num_submits;
-                std::scoped_lock lock2{submit_mutex};
-                submit_cv.notify_all();
+                    --num_submits;
+                    std::scoped_lock lock2{submit_mutex};
+                    submit_cv.notify_all();
+                }
+                ProcessDeferredCommands();
             }
         }
 
@@ -197,7 +211,7 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
 
-        ProcessIdleCommands();
+        ProcessDeferredCommands();
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
 }
@@ -1319,9 +1333,11 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         std::scoped_lock lock{submit_mutex, queue.m_access};
         if (!ccb.empty()) {
             ce_submits.emplace(ProcessCeUpdate(ccb).handle);
+            ++num_ce_enqueued;
             ++num_submits;
         }
         queue.submits.emplace(task.handle);
+        ++queue.num_enqueued;
         ++num_submits;
         submit_cv.notify_one();
     }
@@ -1336,6 +1352,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        ++queue.num_enqueued;
     }
 
     std::scoped_lock lk{submit_mutex};

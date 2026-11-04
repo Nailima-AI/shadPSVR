@@ -49,7 +49,7 @@ s32 GetMoveHandIndex(s32 handle) {
 static const Core::Xr::ControllerSnapshot* FindController(
     s32 handle, const std::optional<Core::Xr::TrackingSnapshot>& snapshot) {
     const s32 hand = GetMoveHandIndex(handle);
-    if (hand < 0 || !snapshot || !snapshot->hands[hand].pose_valid) {
+    if (hand < 0 || !snapshot || !snapshot->hands[hand].connected) {
         return nullptr;
     }
     return &snapshot->hands[hand];
@@ -188,11 +188,14 @@ s32 PS4_SYSV_ABI sceMoveSetVibration(s32 handle, u8 intensity) {
         return ORBIS_MOVE_ERROR_NOT_INIT;
     }
     const s32 hand = GetMoveHandIndex(handle);
+    if (hand >= 0) {
+        // Always accepted, so a stop request is never lost to a tracking or connection gap.
+        Core::Xr::Runtime::Instance().SetVibration(static_cast<Core::Xr::Hand>(hand),
+                                                   static_cast<float>(intensity) / 255.0f);
+    }
     if (!FindController(handle, Core::Xr::Runtime::Instance().GetTrackingSnapshot())) {
         return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
     }
-    Core::Xr::Runtime::Instance().SetVibration(static_cast<Core::Xr::Hand>(hand),
-                                               static_cast<float>(intensity) / 255.0f);
     return ORBIS_OK;
 }
 
@@ -221,6 +224,9 @@ s32 PS4_SYSV_ABI sceMoveClose(s32 handle) {
     if (!g_library_initialized) {
         return ORBIS_MOVE_ERROR_NOT_INIT;
     }
+    if (const s32 hand = GetMoveHandIndex(handle); hand >= 0) {
+        Core::Xr::Runtime::Instance().SetVibration(static_cast<Core::Xr::Hand>(hand), 0.0f);
+    }
     for (auto& registered : g_handles) {
         if (registered == handle) {
             registered = -1;
@@ -234,6 +240,9 @@ s32 PS4_SYSV_ABI sceMoveTerm() {
     if (!g_library_initialized) {
         return ORBIS_MOVE_ERROR_NOT_INIT;
     }
+    Core::Xr::Runtime::Instance().SetVibration(Core::Xr::Hand::Left, 0.0f);
+    Core::Xr::Runtime::Instance().SetVibration(Core::Xr::Hand::Right, 0.0f);
+    g_handles.fill(-1);
     g_library_initialized = false;
     return ORBIS_OK;
 }

@@ -89,10 +89,16 @@ public:
         return num_submits == 0;
     }
 
-    /// Runs func on the GPU thread once every command buffer submitted so far has executed.
-    void SendCommandWhenIdle(auto&& func) {
+    /// Runs func on the GPU thread once every command buffer submitted so far has executed,
+    /// without waiting for later submissions.
+    void SendCommandAfterSubmits(auto&& func) {
         std::scoped_lock lk{submit_mutex};
-        idle_command_queue.emplace(std::move(func));
+        DeferredCommand command{.callback = std::move(func)};
+        for (u32 i = 0; i < NumTotalQueues; ++i) {
+            command.queue_targets[i] = mapped_queues[i].num_enqueued;
+        }
+        command.ce_target = num_ce_enqueued;
+        deferred_commands.emplace(std::move(command));
         submit_cv.notify_one();
     }
 
@@ -200,7 +206,7 @@ private:
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
     void ProcessCommands();
-    void ProcessIdleCommands();
+    void ProcessDeferredCommands();
     void ProcessCeQueue();
     void Process(std::stop_token stoken);
     void HandleGetLodStats(const PM4CmdGetLodStats* get_lod);
@@ -213,6 +219,8 @@ private:
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
         ComputeProgram cs_state{};
+        std::atomic<u64> num_enqueued{};
+        std::atomic<u64> num_completed{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     std::queue<Task::Handle> ce_submits;
@@ -244,7 +252,14 @@ private:
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
-    std::queue<Common::UniqueFunction<void>> idle_command_queue{};
+    struct DeferredCommand {
+        Common::UniqueFunction<void> callback;
+        std::array<u64, NumTotalQueues> queue_targets{};
+        u64 ce_target{};
+    };
+    std::queue<DeferredCommand> deferred_commands{};
+    std::atomic<u64> num_ce_enqueued{};
+    std::atomic<u64> num_ce_completed{};
     std::thread::id gpu_id;
 #ifdef __linux__
     u32 gpu_tid;

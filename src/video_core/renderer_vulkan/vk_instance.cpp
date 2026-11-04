@@ -389,9 +389,14 @@ bool Instance::CreateDevice() {
             std::ranges::any_of(enabled_extensions, [&](const char* enabled) {
                 return std::string_view{enabled} == extension;
             });
-        if (!already_enabled) {
-            add_extension(extension);
+        if (already_enabled) {
+            continue;
         }
+        if (enabled_extensions.size() == enabled_extensions.capacity()) {
+            LOG_ERROR(Render_Vulkan, "No room for OpenXR device extension {}", extension);
+            continue;
+        }
+        add_extension(extension);
     }
 
     const auto family_properties = physical_device.getQueueFamilyProperties();

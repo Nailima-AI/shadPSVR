@@ -31,6 +31,7 @@ enum ControllerButton : u32 {
 enum class Hand : u32 { Left = 0, Right = 1 };
 
 struct ControllerSnapshot {
+    bool connected;
     bool pose_valid;
     PxmPose grip;
     PxmVec3 linear_velocity;

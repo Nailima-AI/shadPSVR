@@ -3,6 +3,19 @@
 
 #include "core/xr/openxr_runtime.h"
 
+// Without OpenXR there is never a headset, so the math the HLE libraries call is unreachable.
+extern "C" {
+void pxm_fov_from_uv_block(const float*, PxmFov* out) {
+    *out = {};
+}
+void pxm_head_from_views(const PxmPose* left, const PxmPose*, PxmPose* out) {
+    *out = *left;
+}
+void pxm_move_from_grip(const PxmPose* grip, PxmVec3, PxmMoveState* out) {
+    *out = {.sphere = *grip};
+}
+}
+
 namespace Core::Xr {
 
 struct Runtime::Impl {

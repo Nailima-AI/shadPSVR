@@ -51,12 +51,12 @@ static AmdGpu::Image ReadTextureSharp(const void* sharp) {
 
 static s32 SubmitStereo(const OrbisHmdReprojectionFrameParam* param,
                         const OrbisHmdReprojectionPose* pose) {
+    if (!Core::Xr::Runtime::Instance().IsHeadsetActive()) {
+        return ORBIS_OK;
+    }
     if (param == nullptr || pose == nullptr || param->left_texture == nullptr ||
         param->right_texture == nullptr) {
         return ORBIS_HMD_ERROR_PARAMETER_NULL;
-    }
-    if (!Core::Xr::Runtime::Instance().IsHeadsetActive()) {
-        return ORBIS_OK;
     }
 
     const std::array eyes{ReadTextureSharp(param->left_texture),
@@ -71,7 +71,7 @@ static s32 SubmitStereo(const OrbisHmdReprojectionFrameParam* param,
         submission.height[eye] = static_cast<u32>(eyes[eye].height) + 1;
     }
     // The eye textures are only complete once the command buffers already submitted have run.
-    liverpool->SendCommandWhenIdle([eyes, submission]() {
+    liverpool->SendCommandAfterSubmits([eyes, submission]() {
         presenter->SubmitXrEyes(eyes, submission);
         TriggerUserEvent(UserEventEnd);
     });
@@ -127,13 +127,6 @@ s32 PS4_SYSV_ABI sceHmdReprojectionFinalizeCapture() {
 s32 PS4_SYSV_ABI sceHmdReprojectionInitialize(const OrbisHmdReprojectionInitParam* param, u32 type,
                                               void* reserved) {
     LOG_INFO(Lib_Hmd, "called, type = {}", type);
-    if (param == nullptr || param->onion_buffer == nullptr || param->garlic_buffer == nullptr) {
-        return ORBIS_HMD_ERROR_PARAMETER_NULL;
-    }
-    if (param->onion_buffer == param->garlic_buffer || param->cpu_mask > 0x3f ||
-        param->pipe_id > 6 || param->queue_id > 7 || type > 2) {
-        return ORBIS_HMD_ERROR_PARAMETER_INVALID;
-    }
     Core::Xr::Runtime::Instance().SetFrameCallback(TriggerCompositorStart);
     g_reprojection_initialized = true;
     return ORBIS_OK;
@@ -169,9 +162,6 @@ s32 PS4_SYSV_ABI sceHmdReprojectionSetDisplayBuffers(s32 video_out_handle, s32 i
                                                      void* reserved) {
     LOG_INFO(Lib_Hmd, "called, video_out_handle = {}, buffers = {}, {}", video_out_handle, index_a,
              index_b);
-    if (index_a == index_b) {
-        return ORBIS_HMD_ERROR_PARAMETER_INVALID;
-    }
     return ORBIS_OK;
 }
 
@@ -207,9 +197,6 @@ s32 PS4_SYSV_ABI sceHmdReprojectionStart2dVr(const OrbisHmdReprojection2dParam* 
     if (!logged) {
         LOG_WARNING(Lib_Hmd, "2D VR screens are not shown in the headset yet");
         logged = true;
-    }
-    if (param == nullptr || param->texture == nullptr) {
-        return ORBIS_HMD_ERROR_PARAMETER_NULL;
     }
     return ORBIS_OK;
 }

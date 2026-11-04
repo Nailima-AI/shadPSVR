@@ -58,8 +58,6 @@ Rebind in SteamVR's controller settings for the "psvr" action set.
 - The frame thread holds the Vulkan submit lock across `xrBeginFrame` / `xrEndFrame`, as
   XR_KHR_vulkan_enable requires for queue access. If SteamVR blocks inside `xrEndFrame`, emulator
   GPU submits wait with it: profile there first if the frame rate drops.
-- Eye textures are copied once the GPU queues are idle, after the title's earlier command
-  buffers. Titles that keep the GPU busy without a gap would delay the copy.
 - `sceVrTrackerGetResult` ignores `prediction_time` and returns the pose OpenXR predicted for the
   next headset frame. Display stays correct because each frame is handed to SteamVR with the pose
   it was rendered with, so its reprojection removes the difference.

@@ -92,11 +92,10 @@ s32 PS4_SYSV_ABI sceCameraClose(s32 handle) {
     // If no handles remain, then the library itself is considered closed.
     if (--g_handles == 0) {
         g_library_opened = false;
-    }
-
-    if (sdl_camera) {
-        SDL_CloseCamera(sdl_camera);
-        sdl_camera = nullptr;
+        if (sdl_camera) {
+            SDL_CloseCamera(sdl_camera);
+            sdl_camera = nullptr;
+        }
     }
 
     return ORBIS_OK;
@@ -469,6 +468,9 @@ s32 PS4_SYSV_ABI sceCameraStart(s32 handle, OrbisCameraStartParameter* param) {
             }
         }
         SDL_free(formats);
+    }
+    if (sdl_camera) {
+        SDL_CloseCamera(sdl_camera);
     }
     sdl_camera = SDL_OpenCamera(devices[EmulatorSettings.GetCameraId()], &cam_spec);
 

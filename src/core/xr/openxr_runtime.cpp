@@ -177,6 +177,10 @@ struct Runtime::Impl {
         }
         case XR_SESSION_STATE_STOPPING:
             session_running = false;
+            vibration[0] = 0.0f;
+            vibration[1] = 0.0f;
+            applied_vibration[0] = 0.0f;
+            applied_vibration[1] = 0.0f;
             Check(xrEndSession(session), "xrEndSession");
             break;
         case XR_SESSION_STATE_EXITING:
@@ -410,13 +414,15 @@ struct Runtime::Impl {
             get_info.action = input.buttons[i];
             XrActionStateBoolean state{.type = XR_TYPE_ACTION_STATE_BOOLEAN};
             if (XR_SUCCEEDED(xrGetActionStateBoolean(session, &get_info, &state)) &&
-                state.isActive && state.currentState) {
-                out.buttons |= 1u << i;
+                state.isActive) {
+                out.connected = true;
+                out.buttons |= state.currentState ? 1u << i : 0u;
             }
         }
         get_info.action = input.trigger;
         XrActionStateFloat trigger{.type = XR_TYPE_ACTION_STATE_FLOAT};
         if (XR_SUCCEEDED(xrGetActionStateFloat(session, &get_info, &trigger)) && trigger.isActive) {
+            out.connected = true;
             out.trigger = trigger.currentState;
         }
 
@@ -600,6 +606,7 @@ struct Runtime::Impl {
             const auto& location = hand_locations[hand];
             const auto& hand_velocity = hand_velocities[hand];
             controller.pose_valid = (location.locationFlags & PoseValid) == PoseValid;
+            controller.connected |= controller.pose_valid;
             if (!controller.pose_valid) {
                 continue;
             }

@@ -14,7 +14,7 @@ CameraBackend GetCameraBackend() {
     if (EmulatorSettings.GetCameraId() != -1) {
         return CameraBackend::Host;
     }
-    if (Core::Xr::Runtime::Instance().IsRequested()) {
+    if (Core::Xr::Runtime::Instance().HasXrInstance()) {
         return CameraBackend::Virtual;
     }
     return CameraBackend::Disconnected;
