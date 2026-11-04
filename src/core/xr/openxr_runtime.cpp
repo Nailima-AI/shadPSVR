@@ -96,8 +96,9 @@ struct Runtime::Impl {
 
     template <typename Fn>
     bool LoadFunction(const char* name, Fn& fn) {
-        return Check(xrGetInstanceProcAddr(instance, name, reinterpret_cast<PFN_xrVoidFunction*>(&fn)),
-                     name);
+        return Check(
+            xrGetInstanceProcAddr(instance, name, reinterpret_cast<PFN_xrVoidFunction*>(&fn)),
+            name);
     }
 
     bool QueryVulkanExtensions() {
@@ -353,8 +354,7 @@ bool Runtime::CreateXrInstance() {
         .type = XR_TYPE_SYSTEM_GET_INFO,
         .formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY,
     };
-    if (!impl->Check(xrGetSystem(impl->instance, &system_info, &impl->system_id),
-                     "xrGetSystem") ||
+    if (!impl->Check(xrGetSystem(impl->instance, &system_info, &impl->system_id), "xrGetSystem") ||
         !impl->LoadFunction("xrGetVulkanInstanceExtensionsKHR", impl->get_instance_extensions) ||
         !impl->LoadFunction("xrGetVulkanDeviceExtensionsKHR", impl->get_device_extensions) ||
         !impl->LoadFunction("xrGetVulkanGraphicsDeviceKHR", impl->get_graphics_device) ||
@@ -396,16 +396,16 @@ std::optional<VkPhysicalDevice> Runtime::GetVulkanPhysicalDevice(VkInstance inst
     return device;
 }
 
-bool Runtime::CreateSession(VkInstance instance, VkPhysicalDevice physical_device,
-                            VkDevice device, u32 queue_family_index, u32 queue_index) {
+bool Runtime::CreateSession(VkInstance instance, VkPhysicalDevice physical_device, VkDevice device,
+                            u32 queue_family_index, u32 queue_index) {
     if (!HasXrInstance() || impl->session != XR_NULL_HANDLE) {
         return impl->session != XR_NULL_HANDLE;
     }
 
     XrGraphicsRequirementsVulkanKHR requirements{.type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
-    if (!impl->Check(impl->get_graphics_requirements(impl->instance, impl->system_id,
-                                                     &requirements),
-                     "xrGetVulkanGraphicsRequirementsKHR")) {
+    if (!impl->Check(
+            impl->get_graphics_requirements(impl->instance, impl->system_id, &requirements),
+            "xrGetVulkanGraphicsRequirementsKHR")) {
         return false;
     }
 
