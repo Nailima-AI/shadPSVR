@@ -24,6 +24,55 @@ SPDX-License-Identifier: GPL-2.0-or-later
         <img src="https://img.shields.io/github/stars/shadps4-emu/shadPS4" width="120">
 </h1>
 
+# shadPSVR: PlayStation VR for shadPS4
+
+> [!WARNING]
+> **This is an unofficial fork of [shadPS4](https://github.com/shadps4-emu/shadPS4)**. Do not ask
+> the shadPS4 team for support with it. It is experimental and has not yet been tested with a
+> commercial PSVR game: so far it has only been checked against
+> [Monado](https://monado.freedesktop.org/)'s simulated headset.
+
+This fork lets PlayStation VR (PS4) games run in shadPS4 using a PC VR headset through
+**OpenXR**: SteamVR, or any other OpenXR runtime. The games' calls into Sony's VR libraries are
+answered from the PC headset, its controllers and an optional webcam. No PSVR hardware is needed.
+
+It replaces the stubs for these libraries:
+
+| PS4 library | What the fork does |
+| --- | --- |
+| `libSceHmd` | Reports a connected PSVR headset, with the real field of view and eye spacing from your headset. Each frame's left and right eye images go to SteamVR, which does the lens correction and reprojection. |
+| `libSceVrTracker` | Returns head, eye and controller poses from OpenXR, placed relative to a virtual PlayStation Camera 1.4 m high and 2 m in front of you, like the real tracker. Also handles recentering and play area warnings. |
+| `libSceMove` | Turns your two VR controllers into two PS Move controllers, with buttons, trigger, motion sensors and rumble. Index, Touch, Vive and generic controllers are mapped. |
+| `libSceCamera` | When no webcam is selected, a virtual camera reports as connected, so VR games start. Otherwise a webcam, or a real PS4 camera on a USB adapter, is passed through for games that use the camera image. |
+
+Everything is off unless you ask for it: a normal build with a normal launch behaves like
+upstream shadPS4.
+
+## Quick start
+
+```bash
+cmake -B build -DENABLE_OPENXR=ON
+cmake --build build
+SHADPS4_OPENXR=1 ./build/shadps4 <game>
+```
+
+- **Requirements:** Clang 19 or newer and Rust (`cargo`). Start SteamVR before launching the game.
+- **Placement settings:** `SHADPS4_PSVR_CAMERA_HEIGHT`, `SHADPS4_PSVR_CAMERA_DISTANCE` and
+  `SHADPS4_PSVR_EYE_HEIGHT` move the virtual camera and set the assumed eye height, in metres.
+- **Webcam:** set `camera_id` in the emulator settings.
+
+## More detail
+
+- [src/xr/README.md](src/xr/README.md): how it is built, controller mapping, what works and
+  what's still missing.
+- [src/xr/CAMERA.md](src/xr/CAMERA.md): how the PS Camera and PSVR tracking work, the tracking
+  coordinate system, and using a real PS4 camera on a PC.
+- PSVR 2 (PS5) is not supported.
+
+The rest of this file is the upstream shadPS4 README.
+
+---
+
 |               Bloodborne by From Software                   |                     Hatsune Miku Project DIVA Future Tone by SEGA                         |
 | :-----------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
 | ![Bloodborne screenshot](./documents/Screenshots/1.png) | ![Project DIVA screenshot](./documents/Screenshots/2.png) |
