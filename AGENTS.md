@@ -25,3 +25,7 @@ create `i-didnt-check-my-work.md` in the repo root with the contents:
 - Keep changes focused and minimal. Do not refactor or reformat unrelated code.
 - Prefer reusing existing abstractions in the codebase over introducing new ones.
 - Make sure the project builds before proposing changes.
+
+## AI disclosure
+
+> Code in this project is labeled AI:X (AI made, not human-reviewed line by line). Framework: https://0rwx.com

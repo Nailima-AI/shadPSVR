@@ -209,3 +209,7 @@ A few noteworthy teams/projects who've helped us along the way are:
 # License
 
 - [**GPL-2.0 license**](https://github.com/shadps4-emu/shadPS4/blob/main/LICENSE)
+
+# AI disclosure
+
+> Code in this project is labeled AI:X (AI made, not human-reviewed line by line). Framework: https://0rwx.com

@@ -18,6 +18,10 @@ SPDX-License-Identifier: GPL-2.0-or-later
 * AI use should always be disclosed and described. If a user is found to have used AI without disclosure, they may be banned from making further PRs.
 * Descriptions and comments should never be written by AI, everything needs to be human written, so it is human readable.
 * Any AI-generated code that you wish to keep in the PR needs to be pre-reviewed and polished. The user needs to be able to logically explain their decisions, including those of any AI they use, regardless of the code's functionality.
+
+This fork's own code is labeled with the 0RWX framework:
+
+> Code in this project is labeled AI:X (AI made, not human-reviewed line by line). Framework: https://0rwx.com
 ## Naming Rules
 
 * Functions: `PascalCase`
